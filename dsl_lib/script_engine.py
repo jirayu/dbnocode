@@ -732,7 +732,12 @@ class ScriptExecutor:
         var_name = inst["var"]
         table = inst["table"]
         where = inst["where"]
-        rows = self.db.query(f'SELECT rowid, data FROM "{table}"')
+        rowid = self._rowid_from_where(where, ctx)
+        if rowid is not None:
+            rows = self.db.query(
+                f'SELECT rowid, data FROM "{table}" WHERE rowid=?', (rowid,))
+        else:
+            rows = self.db.query(f'SELECT rowid, data FROM "{table}"')
         for row in rows:
             doc = json.loads(row.get("data", "{}"))
             doc["_rowid"] = row.get("rowid")
@@ -747,7 +752,12 @@ class ScriptExecutor:
         table = inst["table"]
         sets = inst["sets"]
         where = inst["where"]
-        rows = self.db.query(f'SELECT rowid, data FROM "{table}"')
+        rowid = self._rowid_from_where(where, ctx)
+        if rowid is not None:
+            rows = self.db.query(
+                f'SELECT rowid, data FROM "{table}" WHERE rowid=?', (rowid,))
+        else:
+            rows = self.db.query(f'SELECT rowid, data FROM "{table}"')
         for row in rows:
             doc = json.loads(row.get("data", "{}"))
             doc["_rowid"] = row.get("rowid")
@@ -788,7 +798,12 @@ class ScriptExecutor:
         """DELETE table WHERE field = expr"""
         table = inst["table"]
         where = inst["where"]
-        rows = self.db.query(f'SELECT rowid, data FROM "{table}"')
+        rowid = self._rowid_from_where(where, ctx)
+        if rowid is not None:
+            rows = self.db.query(
+                f'SELECT rowid, data FROM "{table}" WHERE rowid=?', (rowid,))
+        else:
+            rows = self.db.query(f'SELECT rowid, data FROM "{table}"')
         for row in rows:
             doc = json.loads(row.get("data", "{}"))
             doc["_rowid"] = row.get("rowid")
@@ -1119,6 +1134,23 @@ class ScriptExecutor:
             if not self._compare(actual, op, expected):
                 return False
         return True
+
+    def _rowid_from_where(self, where: List[dict], ctx: dict):
+        """If WHERE is a single `_rowid = expr` clause, return the expected
+        rowid as an int for a primary-key lookup, else None.
+
+        Lets FETCH/UPDATE/DELETE query `WHERE rowid = ?` instead of loading
+        the whole table and filtering row-by-row in Python.
+        """
+        if not where or len(where) != 1:
+            return None
+        clause = where[0]
+        if clause.get("field") != "_rowid" or clause.get("op") != "=":
+            return None
+        try:
+            return int(self._eval(clause["expr"], ctx))
+        except (TypeError, ValueError):
+            return None
 
     def _compare(self, left, op, right) -> bool:
         # Normalize for comparison

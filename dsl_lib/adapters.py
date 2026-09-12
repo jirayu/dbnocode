@@ -301,6 +301,7 @@ class RemoteSQLAdapter:
             rids.append(self._send_request(step))
         # Collect all responses
         results = {}
+        errors = {}
         pending = set(rids)
         for _ in range(len(rids) * 200):
             if not pending:
@@ -311,9 +312,16 @@ class RemoteSQLAdapter:
                 results[raw["request_id"]] = raw["response"].get("result", raw["response"])
             elif raw["type"] == "response_error" and raw["request_id"] in pending:
                 pending.discard(raw["request_id"])
-                results[raw["request_id"]] = {"cols": [], "rows": []}
+                err = raw.get("error", {})
+                errors[raw["request_id"]] = err.get("message", err)
             elif raw["type"] == "hello_ok":
                 continue
+        if errors:
+            msgs = "; ".join(f"req {rid}: {m}" for rid, m in errors.items())
+            raise RuntimeError(f"Hrana batch query failed: {msgs}")
+        if pending:
+            raise RuntimeError(
+                f"Hrana: no response for {len(pending)} of {len(rids)} query requests")
         out = []
         for rid in rids:
             result = results.get(rid, {"cols": [], "rows": []})
@@ -330,7 +338,7 @@ class RemoteSQLAdapter:
         """Execute multiple non-SELECT statements in parallel.
 
         Each entry in *statements* is (sql, params).
-        Errors on individual statements are silently ignored.
+        Raises RuntimeError if any statement fails (no silent partial commits).
         """
         if not statements:
             return
@@ -348,13 +356,24 @@ class RemoteSQLAdapter:
                 "stmt": stmt,
             }))
         pending = set(rids)
+        errors = {}
         for _ in range(len(rids) * 200):
             if not pending:
                 break
             raw = self._recv()
             rid = raw.get("request_id")
-            if rid in pending:
-                pending.discard(rid)
+            if rid not in pending:
+                continue
+            pending.discard(rid)
+            if raw["type"] == "response_error":
+                err = raw.get("error", {})
+                errors[rid] = err.get("message", err)
+        if errors:
+            msgs = "; ".join(f"req {rid}: {m}" for rid, m in errors.items())
+            raise RuntimeError(f"Hrana batch execute failed: {msgs}")
+        if pending:
+            raise RuntimeError(
+                f"Hrana: no response for {len(pending)} of {len(rids)} execute requests")
         _perf_log.debug("execute_many %d stmts %.3fs", len(statements), time.perf_counter() - t0)
 
     def execute(self, sql: str, params: tuple = ()):
