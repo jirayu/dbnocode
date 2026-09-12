@@ -20,6 +20,13 @@ END
 
 That is a complete app: a customer table, an entry form, and a browsable list.
 
+## Screenshots
+
+![Main menu](screenshot/MainMenu.png)
+![Master-detail form](screenshot/master_details.png)
+![Data entry (CRUD)](screenshot/CRUD.png)
+![Browse listing](screenshot/Listing.png)
+
 ## Why dbnocode
 
 - **Go from idea to working app in minutes** — screens, actions and menu wiring
