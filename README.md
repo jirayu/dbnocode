@@ -46,6 +46,51 @@ That is a complete app: a customer table, an entry form, and a browsable list.
 | **Menus & navigation** | Pulldown top-bar menus or a center launcher, hotkeys, module `INCLUDE`s |
 | **Multi-user backends** | Optional shared server for PostgreSQL / Firebird / libSQL — run with a local file, or go remote |
 
+## Author with AI
+
+You don't have to write a DSL script by hand. Hand an AI assistant the three
+reference documents, describe the application you need, and let it write
+the `.dsl` file for you.
+
+**Auto Repair Shops, an ERP, Accounting, Point-of-Sale, Inventory** — whatever
+you describe, the AI generates a validated, runnable script. Edit the text file
+line by line any time to tweak it; every screen you see is defined in plain text.
+
+1. Give your AI assistant these three files:
+   - `docs/dsl_tutorial.md` — how to build forms, details, stock, reports, menus
+   - `docs/canonical_dsl.md` — the canonical DSL reference
+   - `docs/grammar.ebnf` — the formal grammar
+   - (optional) any sample script under `scripts/` as a style reference
+2. Paste this prompt and describe your app:
+
+   ```text
+   You are authoring a dbnocode DSL application.
+   Read docs/dsl_tutorial.md, docs/canonical_dsl.md and docs/grammar.ebnf.
+
+   Build an application for: {describe your app — e.g. an auto repair shop
+   with work orders, customer vehicles, parts stock and a job pricing report}
+
+   Rules:
+   - Write the complete script to scripts/my_app.dsl using the compact DSL only
+   - Include a MENU and one or more FORMs with LISTs; add DETAIL, STOCK
+     operations and REPORTs where the app needs them
+   - Use only documented field flags: req, num, date, ro, upper, prefix,
+     span, rows, default, opts, lookup, fill, filter, formula
+   - Match the style of the sample scripts and do not modify Python files
+   - Validate the result with:  python main.py --validate-only scripts/my_app.dsl
+   ```
+
+3. Run the generated app:
+
+   ```bash
+   python main.py --validate-only scripts/my_app.dsl   # check it first
+   python main.py scripts/my_app.dsl                   # or just run it
+   ```
+
+A minimal sample app is included in `scripts/01_main_menu_compact.dsl` — the
+simplest starting point to copy, modify, or show your AI assistant as an
+example target.
+
 ## Quick start
 
 ```bash
