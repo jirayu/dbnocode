@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# SQLite databases (per-company data — do not commit)
+*.db
+
+# Runtime config / data sidecars (per-user state)
+*_colcfg.json
+*_companies.json
+remote_connections.json
+dbnocode_settings.json
+print_config.json
+udf_schemas.json
+custom_options.json
+
+# Build artifacts
+dist/
+build/
+*.spec
+final_gui.py
+*.exe
+
+# Scratch / dev-only files
+_debug.bat
+_test_*.bat
+_test_*.ps1
+_test_*.txt
+lab/
+
+# AI tooling config (local only)
+.claude/
+.opencode/
+
+# Temp / cache dirs
+.pytest_cache/
+.runtime-temp/
+.test_tmp/
+.tmp/
+temp/
+
+# Logs
+crash.log
+errors.log
+
+# OS
+Thumbs.db
+.DS_Store

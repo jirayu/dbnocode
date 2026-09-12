@@ -1,0 +1,691 @@
+==============================================================
+  dbNoCode DSL Tutorial -- Build Business Apps Without Coding
+==============================================================
+
+This tutorial walks you through building a complete inventory
+management system using the dbNoCode DSL. No programming
+experience required -- just follow along step by step.
+
+
+--------------------------------------------------------------
+  1. GETTING STARTED
+--------------------------------------------------------------
+
+1.1 What is dbNoCode?
+
+  dbNoCode lets you build database applications by writing
+  a simple text file (a "DSL script"). The system reads your
+  script and creates a full working application with:
+
+  - Data entry forms
+  - Listing grids with search and sort
+  - Lookup dialogs
+  - Status-based workflows (Draft -> Posted -> Void)
+  - Business logic scripts
+  - Menus and keyboard shortcuts
+
+  No Python, SQL, or web framework knowledge needed.
+
+
+1.2 Running Your First App
+
+  Create a text file (e.g. my_app.dsl) and run it:
+
+    python main.py my_app.dsl
+
+  The app opens in your terminal. Use keyboard to navigate.
+
+
+1.3 Minimum Script
+
+  Every script starts with two lines:
+
+    APP "My First App" VERSION "1.0"
+    DATASOURCE "mydb" ADAPTER "sqlite"
+
+  APP gives your application a name and version.
+  DATASOURCE tells the system to use a SQLite database.
+  The database file is created automatically.
+
+
+--------------------------------------------------------------
+  2. CREATING FORMS
+--------------------------------------------------------------
+
+2.1 A Simple Form
+
+  Let's create a form to manage vendors:
+
+    FORM vendor TITLE "Vendor Master"
+      vendor_code | 10 | req prefix:VEN
+      vendor_name | 40 | req
+      phone       | 15 |
+      email       | 30 |
+      LIST vendor_code:10 vendor_name:30 phone:15
+    END
+
+  Breaking this down:
+
+    FORM vendor          The form name (also the database table)
+    TITLE "Vendor..."    Title shown at the top of the form
+    END                  Marks the end of the form block
+
+  Each field line has three parts separated by | (pipe):
+
+    field_id | width | flags
+
+    vendor_code | 10 | req prefix:VEN
+    ^             ^    ^     ^
+    |             |    |     Auto-number prefix (VEN-0001, VEN-0002...)
+    |             |    Required field
+    |             Display width (characters)
+    Field name (also the database column)
+
+  The LIST line defines which columns appear in the listing:
+
+    LIST vendor_code:10 vendor_name:30 phone:15
+         ^           ^
+         column name  column width
+
+
+2.2 Field Flags Reference
+
+  req              Field is required (cannot be blank)
+  num              Numeric field (auto-formats with commas)
+  date             Date field (date picker)
+  ro               Read-only (user cannot edit)
+  prefix:XXX       Auto-generate running number (XXX-0001)
+  span:N           Span N columns in multi-column layout
+  default:VALUE    Default value for new records
+  opts:A,B,C       Dropdown with fixed choices
+  lookup:table     Lookup from another table
+  fill:field       Auto-fill a field from lookup selection
+  copydetail:name  Copy detail lines from parent document
+  filter:f=v       Filter lookup rows (e.g. filter:status=Posted)
+  formula:expr     Auto-calculated (e.g. formula:qty*price)
+
+
+2.3 Multi-Column Layout
+
+  Add COLS to arrange fields side by side:
+
+    FORM vendor TITLE "Vendor Master" COLS 2
+      vendor_code | 10 | req prefix:VEN
+      vendor_name | 40 | req span:2    <-- spans both columns
+      phone       | 15 |               <-- left column
+      email       | 30 |               <-- right column
+      LIST vendor_code:10 vendor_name:30 phone:15
+    END
+
+
+2.4 Sections
+
+  Group fields visually with SECTION:
+
+    FORM item TITLE "Item Master" COLS 2
+      SECTION "Item Information"
+      part_no    | 12 | req prefix:ITM
+      part_name  | 40 | req span:2
+      category   |    | opts:Raw Material,Finished Good,Component
+      SECTION "Stock Levels"
+      on_hand    |    | num default:0
+      on_order   |    | num default:0
+      LIST part_no:12 part_name:30 category:14 on_hand:10
+    END
+
+
+--------------------------------------------------------------
+  3. LOOKUPS
+--------------------------------------------------------------
+
+3.1 Basic Lookup
+
+  Reference another table so users can pick from a list:
+
+    vendor_code | 10 | lookup:vendor fill:vendor_name
+
+  - lookup:vendor    Press F4 to open vendor lookup dialog
+  - fill:vendor_name Automatically fill vendor_name from selection
+
+  When the user presses F4 on vendor_code, a search dialog
+  shows all vendors. Selecting one fills both vendor_code
+  and vendor_name.
+
+
+3.2 Filtered Lookup
+
+  Show only records matching a condition:
+
+    po_number | 12 | lookup:po filter:status=Posted fill:vendor_name
+
+  This only shows POs with status "Posted" in the lookup.
+
+
+3.3 Copy Detail Lines
+
+  Copy child rows from a parent document:
+
+    po_number | 12 | lookup:po filter:status=Posted
+                      fill:vendor_name copydetail:po_line
+
+  When a PO is selected, its order lines are automatically
+  copied into the current document's detail grid.
+
+
+--------------------------------------------------------------
+  4. DETAIL GRIDS (Child Tables)
+--------------------------------------------------------------
+
+4.1 Adding a Detail Grid
+
+  Detail grids hold child records (e.g. order lines):
+
+    FORM po TITLE "Purchase Order" COLS 2
+      SECTION "Header"
+      po_number   | 12 | req prefix:PO
+      po_date     |    | date
+      vendor_code | 10 | lookup:vendor fill:vendor_name
+      vendor_name | 40 |
+      DETAIL "Order Lines" AS po_line TOTALS
+        part_no   | 12 | lookup:item fill:part_name
+        part_name | 25 | ro
+        qty       | 10 | num
+        price     | 12 | num
+        amount    | 14 | num formula:qty*price
+      END DETAIL
+      LIST po_number:12 po_date:12 vendor_code:10 vendor_name:25
+    END
+
+  Breaking this down:
+
+    DETAIL "Order Lines"   Tab label shown in the form
+    AS po_line             Child table name
+    TOTALS                 Show column totals at the bottom
+    END DETAIL             End of detail block
+
+  Detail columns use the same flags as form fields.
+  formula:qty*price auto-calculates the amount column.
+
+  In the form, press Ins to add rows, Ctrl+D to delete.
+
+4.2 COEDIT (Vertical Column Entry)
+
+  COEDIT enables a focused data-entry mode where only one column is
+  editable and Enter moves to the next row (vertical typing).
+
+    DETAIL "Lines" AS po_line TOTALS
+      part_no | 12 | lookup:item
+      qty     | 10 | num
+      amount  | 14 | num formula:qty*unit_price
+      COEDIT qty
+    END DETAIL
+
+  The CoEdit column is highlighted in yellow. ESC exits CoEdit mode.
+  You can also toggle CoEdit on any column with Ctrl+E while in the
+  detail grid. CoEdit persists through F7 filtering.
+
+4.3 PREFILL (Pre-populate Detail from Source Table)
+
+  PREFILL loads rows from another table into the detail grid when
+  creating a new record. Combined with COEDIT, this creates a
+  web-order-style entry screen where the user types quantities.
+
+    DETAIL "Order Lines" AS wo_line TOTALS
+      prod_code  | 12 | ro
+      prod_name  | 25 | ro
+      on_hand    |  8 | num ro
+      order_qty  | 10 | num
+      unit_price | 10 | num ro
+      amount     | 14 | num formula:order_qty*unit_price
+      PREFILL product filter:on_hand>0
+      COEDIT order_qty
+    END DETAIL
+
+  How it works:
+  - On new record, all products with on_hand > 0 fill the grid
+  - Detail columns map to source fields by matching name
+  - Only order_qty is editable (all others are read-only)
+  - CoEdit drops the cursor into order_qty column
+  - F7 filter lets user narrow by category, name, etc.
+  - On save, only rows with order_qty > 0 are stored
+
+4.4 COMPUTED (Header Totals from Detail Lines)
+
+  COMPUTED fields auto-calculate header values from detail data.
+  They update live as detail rows are added, edited, or deleted.
+
+    FORM po TITLE "Purchase Order" COLS 2
+      po_number    | 12 | req prefix:PO
+      total_amount | 14 | num ro
+      line_count   |  6 | num ro
+      DETAIL "Lines" AS po_line TOTALS
+        part_no | 12 | lookup:item
+        qty     | 10 | num
+        amount  | 14 | num formula:qty*unit_price
+      END DETAIL
+      COMPUTED
+        total_amount = SUM(lines, amount)
+        line_count   = COUNT(lines)
+      END COMPUTED
+      LIST po_number:12 total_amount:14
+    END
+
+  Available functions:
+    SUM(lines, field)        Sum a detail column
+    COUNT(lines)             Count non-empty detail rows
+    IF(cond, true, false)    Conditional expression
+    Arithmetic: + - * /      Standard math operators
+
+
+--------------------------------------------------------------
+  5. MENUS
+--------------------------------------------------------------
+
+5.1 Basic Menu
+
+    MENU "My Application"
+      PULLDOWN "File"
+        "New Vendor" => vendor
+        "Vendor List" => vendor.list
+        ---
+        "Exit" => EXIT HOTKEY ESC
+      END
+      CENTER
+        "1. Vendors" => vendor
+        "2. Vendor List" => vendor.list
+        "3. Exit" => EXIT
+      END
+    END
+
+  PULLDOWN creates a dropdown menu in the top bar.
+  CENTER creates a main screen menu with numbered options.
+
+  Menu targets:
+    vendor       Opens the vendor form (for adding/editing)
+    vendor.list  Opens the vendor listing grid
+    EXIT         Exits the application
+    RESET        Triggers data reset (see Section 8)
+    SWITCH       Opens company/database switcher
+
+  HOTKEY assigns a keyboard shortcut (F2, F3, F4, ESC).
+  --- creates a separator line in pulldown menus.
+
+
+--------------------------------------------------------------
+  6. WORKFLOW (Status Transitions)
+--------------------------------------------------------------
+
+6.1 What is a Workflow?
+
+  Many business documents have a lifecycle:
+
+    Draft  -->  Posted  -->  Void
+
+  A Purchase Order starts as Draft. When confirmed, it moves
+  to Posted. If cancelled, it moves to Void.
+
+  WORKFLOW automates this and runs business logic at each step.
+
+
+6.2 Setting Up Workflow
+
+  Step 1: Add a status field to your form:
+
+    status | | ro default:Draft
+
+  Step 2: Define SCRIPT blocks with the business logic:
+
+    SCRIPT post
+      FOREACH line IN lines
+        FETCH item FROM item WHERE part_no = line.part_no
+        UPDATE item SET on_order = item.on_order + line.qty
+               WHERE _rowid = item._rowid
+      END
+    ENDSCRIPT
+
+    SCRIPT void
+      FOREACH line IN lines
+        FETCH item FROM item WHERE part_no = line.part_no
+        UPDATE item SET on_order = item.on_order - line.qty
+               WHERE _rowid = item._rowid
+      END
+    ENDSCRIPT
+
+  Step 3: Define the WORKFLOW transitions:
+
+    WORKFLOW ON status
+      Draft > Posted : post
+      Posted > Void : void
+    END WORKFLOW
+
+  When the user presses F5 on a Draft PO, the system:
+  1. Shows a menu with "Post Purchase Order"
+  2. Runs the "post" script (increases item on_order)
+  3. Changes status from Draft to Posted
+
+  When F5 is pressed on a Posted PO:
+  1. Shows "Void Purchase Order"
+  2. Runs the "void" script (reverses the on_order change)
+  3. Changes status to Void
+
+
+--------------------------------------------------------------
+  7. SCRIPT LANGUAGE
+--------------------------------------------------------------
+
+7.1 Overview
+
+  Scripts are named blocks of business logic inside a FORM.
+  They execute when triggered by WORKFLOW transitions.
+
+    SCRIPT script_name
+      ... instructions ...
+    ENDSCRIPT
+
+
+7.2 Variables and Expressions
+
+  SET assigns a value to a variable:
+
+    SET total = 0
+    SET name = "Hello"
+    SET result = qty * price + tax
+
+  Expressions support:
+    Math:       + - * /
+    Compare:    = != > >= < <=
+    Logic:      AND OR NOT
+    Null check: IS NULL, IS NOT NULL
+
+  Access fields by name:
+    po_number          header field from current form
+    line.part_no       field from current detail row
+    item.on_hand       field from a FETCHed record
+    item._rowid        internal rowid of FETCHed record
+
+
+7.3 Conditions
+
+    IF on_hand > 0
+      SET msg = "In stock"
+    ELIF on_order > 0
+      SET msg = "On order"
+    ELSE
+      SET msg = "Out of stock"
+    END
+
+
+7.4 Loops
+
+  FOREACH iterates over detail lines:
+
+    FOREACH line IN lines
+      SET total = total + line.amount
+    END
+
+  Use BREAK to exit early, CONTINUE to skip to next item.
+
+
+7.5 Database Operations
+
+  FETCH finds a record:
+
+    FETCH item FROM item WHERE part_no = line.part_no
+
+    This finds the item record where part_no matches,
+    and stores it in the variable "item".
+
+  FETCH with multiple conditions:
+
+    FETCH po_ln FROM po_line
+          WHERE part_no = line.part_no
+            AND _parent_rowid = po_rec._rowid
+
+  UPDATE modifies a record:
+
+    UPDATE item SET on_hand = item.on_hand + line.qty
+           WHERE _rowid = item._rowid
+
+  INSERT creates a new record:
+
+    INSERT item_card SET trans_date = TODAY(),
+                         trans_type = "RECV",
+                         doc_no = grn_no,
+                         receive_qty = line.received_qty,
+                         balance = item.on_hand,
+                         _parent_rowid = item._rowid
+
+    Note: set _parent_rowid to link child records to parents.
+
+  DELETE removes records:
+
+    DELETE old_log WHERE status = "Expired"
+
+
+7.6 Error Handling
+
+    IF item._rowid IS NULL
+      FAIL "Item not found: " + line.part_no
+    END
+
+  FAIL stops execution and shows an error message.
+  OK sets a success message (shown after script completes).
+
+
+7.7 Calling Other Scripts
+
+    SCRIPT validate
+      IF total <= 0
+        FAIL "Total must be positive"
+      END
+    ENDSCRIPT
+
+    SCRIPT post
+      SET total = SUM(lines, "amount")
+      CALL validate
+      ...
+    ENDSCRIPT
+
+
+7.8 Built-in Functions
+
+  Math:
+    ADD(a, b)          Addition
+    SUB(a, b)          Subtraction
+    ABS(n)             Absolute value
+    ROUND(n, decimals) Round number
+    MIN(a, b)          Minimum
+    MAX(a, b)          Maximum
+
+  Lists:
+    COUNT(list)        Number of items
+    SUM(list, "field") Sum a field across all items
+
+  Date/Time:
+    TODAY()            Current date (YYYY-MM-DD)
+    NOW()              Current datetime
+
+  Strings:
+    UPPER(s)           Uppercase
+    LEN(s)             Length
+    STR(n)             Convert to string
+
+  Type checking:
+    NUM(s)             Convert to number
+    ISNULL(v)          True if null/empty/zero
+    ISBLANK(v)         True if null or blank
+
+
+--------------------------------------------------------------
+  8. ON SAVE and RESET
+--------------------------------------------------------------
+
+8.1 ON SAVE
+
+  Run logic every time a record is saved:
+
+    ON SAVE
+      IF header.on_hand
+        WRITE item_card
+          trans_date  = TODAY
+          trans_type  = "INIT"
+          doc_no      = header.part_no
+          receive_qty = header.on_hand
+          balance     = header.on_hand
+        END WRITE
+      END IF
+    END SAVE
+
+  This creates an initial stock card entry whenever an item
+  is saved with on_hand > 0. On update, if only 1 INIT entry
+  exists, it is replaced; if real transactions exist, it skips.
+
+
+8.2 RESET
+
+  Define what happens when "Reset All Data" is selected:
+
+    RESET
+      CLEAR po, po_line, grn, grn_line, issue, issue_line
+      UPDATE item SET on_hand = 0, on_order = 0
+    END RESET
+
+  CLEAR deletes all rows from the listed tables.
+  UPDATE modifies existing rows (e.g. reset counters to 0).
+  Tables not mentioned are preserved (masters stay intact).
+
+  Place the RESET block after the MENU block, before the
+  end of the file.
+
+
+--------------------------------------------------------------
+  9. PUTTING IT ALL TOGETHER
+--------------------------------------------------------------
+
+  Here is a minimal but complete inventory app:
+
+    APP "Mini Inventory" VERSION "1.0"
+    DATASOURCE "inventory" ADAPTER "sqlite"
+
+    // Master table
+    FORM item TITLE "Item Master" COLS 2
+      SECTION "Item"
+      part_no   | 12 | req prefix:ITM
+      part_name | 40 | req span:2
+      uom       |    | opts:PC,KG,BOX
+      on_hand   |    | num default:0
+      LIST part_no:12 part_name:30 uom:6 on_hand:10
+    END
+
+    // Transaction with workflow
+    FORM issue TITLE "Issue Slip" COLS 2
+      SECTION "Issue"
+      issue_no  | 12 | req prefix:IS
+      issue_date|    | date
+      status    |    | ro default:Draft
+      DETAIL "Lines" AS issue_line TOTALS
+        part_no   | 12 | lookup:item fill:part_name
+        part_name | 25 | ro
+        qty       | 10 | num
+      END DETAIL
+      SCRIPT post
+        FOREACH line IN lines
+          FETCH item FROM item WHERE part_no = line.part_no
+          UPDATE item SET on_hand = item.on_hand - line.qty
+                 WHERE _rowid = item._rowid
+        END
+      ENDSCRIPT
+      SCRIPT void
+        FOREACH line IN lines
+          FETCH item FROM item WHERE part_no = line.part_no
+          UPDATE item SET on_hand = item.on_hand + line.qty
+                 WHERE _rowid = item._rowid
+        END
+      ENDSCRIPT
+      WORKFLOW ON status
+        Draft > Posted : post
+        Posted > Void : void
+      END WORKFLOW
+      LIST issue_no:12 issue_date:12 status:10
+    END
+
+    MENU "Mini Inventory"
+      PULLDOWN "File"
+        "Items" => item HOTKEY F2
+        "Item List" => item.list
+        ---
+        "Exit" => EXIT HOTKEY ESC
+      END
+      PULLDOWN "Transaction"
+        "New Issue" => issue HOTKEY F3
+        "Issue List" => issue.list
+      END
+      CENTER
+        "1. Item Master" => item
+        "2. Item List" => item.list
+        "3. New Issue" => issue
+        "4. Issue List" => issue.list
+        "5. Exit" => EXIT
+      END
+    END
+
+
+--------------------------------------------------------------
+  10. KEYBOARD SHORTCUTS
+--------------------------------------------------------------
+
+  Main Menu:
+    Arrow keys       Navigate menus
+    Enter            Select item
+    ESC              Exit / go back
+
+  Form View:
+    Tab / Shift+Tab  Move between fields
+    F4               Open lookup (on lookup fields)
+    F5               Workflow action (Post/Void)
+    F10 or Ctrl+S    Save record
+    ESC              Cancel and go back
+
+  Detail Grid (inside form):
+    Arrow keys       Navigate cells
+    Enter            Edit cell
+    Ins              Add new row
+    Ctrl+D           Delete row
+
+  List View:
+    Arrow keys       Navigate rows
+    Enter            Open record for editing
+    F3               Create new record
+    F8               Configure columns
+    Ctrl+D           Delete record
+    ESC              Go back to menu
+
+  Numeric keypad Enter works everywhere.
+
+
+--------------------------------------------------------------
+  11. TIPS
+--------------------------------------------------------------
+
+  - Start simple: create master tables first, then transactions.
+
+  - Use prefix: on key fields for auto-numbering.
+
+  - Always define a LIST line so the listing grid shows
+    the right columns.
+
+  - Use COLS 2 for forms with many fields to save space.
+
+  - Make status fields "ro default:Draft" so users cannot
+    edit them directly -- only WORKFLOW changes status.
+
+  - Write SCRIPT void as the exact reverse of SCRIPT post
+    so voiding perfectly undoes the posting.
+
+  - Test with small data first. Use Reset All Data to start
+    fresh during development.
+
+  - Comments start with // and are ignored by the parser.
+
+  - The database file (.db) is created in the working
+    directory. Delete it to start completely fresh.

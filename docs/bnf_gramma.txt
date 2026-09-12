@@ -1,0 +1,725 @@
+==============================================================
+VERBOSE DSL SYNTAX (Original)
+==============================================================
+
+<app> ::= "APP" <quoted_id> "VERSION" <quoted_str>
+<datasource> ::= "DATASOURCE" <quoted_id> "ADAPTER" ("sqlite"|"postgres")
+<form> ::= "FORM" <quoted_id> <form_body> "END FORM"
+<form_body> ::= ( <section> | <field> )*
+<section> ::= "SECTION" <quoted_str>
+<field> ::= "FIELD" <quoted_id> "TYPE" <type> [<field_options>]
+<field_options> ::= ["REQUIRED"] ["LEN" <int>] ["DEFAULT" <value>]
+                    ["PREFIX" <quoted_str>] ["SPAN" <int>]
+                    ["LOOKUP" <quoted_id>] ["LOOKUPFILL" <quoted_id>]
+                    ["ENUM" "[" <quoted_csv> "]"]
+<grid> ::= "GRID" <quoted_id> "BELONGS_TO" <quoted_id> ["TOTALS" <0|1>]
+           <column>* "END GRID"
+<column> ::= "COLUMN" <quoted_id> "TYPE" <type> ["WIDTH" <int>]
+             ["LOOKUP" <quoted_id>] ["LOOKUPFILL" <quoted_id>]
+             ["FORMULA" <quoted_expr>] ["READONLY"]
+             ["ENUM" "[" <quoted_csv> "]"]
+<layout> ::= "LAYOUT" <quoted_id> ["TITLE" <quoted_str>]
+              "POSITION" <int> <int> "WIDTH" <int> "HEIGHT" <int>
+              "BORDER" <0|1>
+              <layout_content>* "END LAYOUT"
+<layout_content> ::= <layout_form> | <layout_grid> | <layout_tabs>
+                   | <layout_button> | <top_menu> | <center_menu>
+<layout_form> ::= "FORM" <quoted_id> "Y=" <int> "X=" <int> ["COLS=" <int>]
+<layout_grid> ::= "GRID" <quoted_id> "Y=" <int> "X=" <int> "HEIGHT=" <int>
+<layout_tabs> ::= "TABS" "Y=" <int> "X=" <int> "HEIGHT=" <int>
+                  <tab>+ "END TABS"
+<tab> ::= "TAB" <quoted_str> "GRID" <quoted_id>
+<layout_button> ::= "BUTTON" <quoted_str> "RUN" <quoted_id> "Y=" <int> "X=" <int>
+<top_menu> ::= "TOP_MENU" <pulldown>+ "END TOP_MENU"
+<pulldown> ::= "PULLDOWN" <quoted_str> <menu_item>+ "END PULLDOWN"
+<center_menu> ::= "CENTER_MENU" <menu_item>+ "END CENTER_MENU"
+<menu_item> ::= "ITEM" <quoted_str> "RUN" <quoted_id> ["HOTKEY" <quoted_str>]
+              | "SEPARATOR"
+<action> ::= "ACTION" <quoted_id> "GOTO" <quoted_id>
+           | "ACTION" <quoted_id> "EXIT"
+<type> ::= STRING | INT | FLOAT | DATE | BOOL | ENUM
+
+
+==============================================================
+COMPACT DSL SYNTAX (Simplified)
+==============================================================
+
+Produces same runtime output as verbose. Auto-generates
+GRID, LAYOUT, and ACTION definitions from FORM + MENU blocks.
+
+<app> ::= "APP" <quoted_str> "VERSION" <quoted_str>
+<datasource> ::= "DATASOURCE" <quoted_str> "ADAPTER" ("sqlite"|"postgres")
+
+-- FORM block --
+
+<form> ::= "FORM" <name> ["TITLE" <quoted_str>] ["COLS" <int>]
+           <form_body>
+           "END"
+
+<form_body> ::= ( <section> | <field_line> | <detail>
+               | <script_block> | <workflow_block>
+               | <on_save_block> | <list_line> )*
+
+<section> ::= "SECTION" <quoted_str>
+
+<field_line> ::= <field_id> "|" [<width>] "|" [<flags>]
+
+<flags> ::= space-separated tokens:
+    req                    -- field is required
+    num                    -- FLOAT type
+    date                   -- DATE type
+    ro                     -- read-only
+    prefix:<str>           -- auto-number prefix (e.g. prefix:PO)
+    span:<int>             -- column span in multi-column layout
+    rows:<int>             -- multi-line text field (Enter moves between lines,
+                              Tab exits group, value saved as newline-joined)
+    default:<val>          -- default value
+    opts:<a>,<b>,..        -- ENUM with listed values
+    lookup:<name>          -- lookup from table <name>
+    fill:<field>           -- fill companion field from lookup result
+    copydetail:<detail>    -- copy detail lines from parent document
+    readonly_below:<int>   -- read-only when current user level is below int
+    filter:<f>=<v>[,...]   -- filter lookup rows (e.g. filter:status=Posted)
+    formula:<expr>         -- calculated field expression
+
+<detail> ::= "DETAIL" <quoted_str> "AS" <name> ["TOTALS"]
+             <col_line>*
+             ["PREFILL" <source_table> ["filter:" <expr>]]
+             ["COEDIT" <col_name>]
+             "END DETAIL"
+
+  PREFILL pre-populates the detail grid with rows from another table.
+  Fields are matched by column name. With COEDIT, only rows where the
+  entry column has a non-zero value are saved.
+  Filter expression restricts which source rows are loaded.
+  Example: PREFILL product filter:on_hand>0
+
+  COEDIT auto-enters vertical column-edit mode on the named column.
+  Only one column is editable; Enter moves to next row. Ctrl+E toggles.
+  ESC exits CoEdit mode. CoEdit persists through F7 filter.
+
+<tree_detail> ::= "TREE_DETAIL" <quoted_str> "AS" <name>
+                  "children_key:" <field> "tree_label:" <field>
+                  <col_line>*
+                  "END TREE_DETAIL"
+
+  Hierarchical detail grid with collapsible parent/child rows.
+  children_key specifies the nested array field name.
+  tree_label specifies which column shows the tree indent.
+
+<col_line> ::= <col_id> "|" [<width>] "|" [<col_flags>]
+<col_flags> ::= (same as <flags> above)
+
+<list_line> ::= "LIST" (<col_id>:<width>)+
+
+-- COMPUTED block (auto-calculated header fields from detail lines) --
+
+<computed_block> ::= "COMPUTED"
+                     (<field_name> "=" <expression>)*
+                     "END COMPUTED"
+
+  Expressions may use:
+    SUM(lines, field)       — sum a detail column
+    COUNT(lines)            — count non-empty detail rows
+    IF(cond, true, false)   — conditional
+    Arithmetic: +, -, *, /
+    Header field names       — reference other header values
+
+-- UDF block (user-defined fields panel on right side of form) --
+
+<udf_block> ::= "UDF" <quoted_string>
+
+  The quoted string is the schema name. Schema definitions are stored in
+  udf_schemas.json and managed at runtime via F7.
+  F6 toggles focus between main form and UDF panel.
+  UDF values are stored as nested "udf" dict inside each record.
+
+  Example:
+    UDF "udf_items"
+
+-- HIGHLIGHT block (conditional row colors on list grid) --
+
+<highlight_block> ::= "HIGHLIGHT"
+                      (<condition> "|" <style>)*
+                      "END HIGHLIGHT"
+
+  Styles: error, warn, hilite, dim, success, bold,
+          yellow, cyan, green, red
+
+  Condition uses Python expressions against row fields:
+    status == "Void"  |  error
+    on_hand == 0      |  warn
+    on_hand > 100     |  success
+
+-- SCRIPT block (named subroutine) --
+
+<script_block> ::= "SCRIPT" <name>
+                   <script_body>
+                   "ENDSCRIPT"
+
+<script_body> ::= <script_instruction>*
+
+<script_instruction> ::=
+    <set_stmt>
+  | <if_stmt>
+  | <foreach_stmt>
+  | <fetch_stmt>
+  | <update_stmt>
+  | <insert_stmt>
+  | <delete_stmt>
+  | <fail_stmt>
+  | <ok_stmt>
+  | <call_stmt>
+  | <stock_stmt>
+  | <break_stmt>
+  | <continue_stmt>
+
+<set_stmt>      ::= "SET" <var> "=" <expression>
+<if_stmt>       ::= "IF" <expression>
+                       <script_body>
+                     { "ELIF" <expression>
+                       <script_body> }
+                     [ "ELSE"
+                       <script_body> ]
+                     "END"
+<foreach_stmt>  ::= "FOREACH" <var> "IN" <expression>
+                       <script_body>
+                     "END"
+<fetch_stmt>    ::= "FETCH" <var> "FROM" <table>
+                     "WHERE" <where_clause>
+<update_stmt>   ::= "UPDATE" <table> "SET" <assignments>
+                     "WHERE" <where_clause>
+<insert_stmt>   ::= "INSERT" <table> "SET" <assignments>
+<delete_stmt>   ::= "DELETE" <table> "WHERE" <where_clause>
+<fail_stmt>     ::= "FAIL" <expression>
+<ok_stmt>       ::= "OK" <expression>
+<call_stmt>     ::= "CALL" <script_name>
+                   | "CALL" <script_name> "(" <expression> { "," <expression> } ")"
+<stock_stmt>    ::= "STOCK" <stock_operation> ["REVERSE"]
+                     <stock_mapping> { "|" <stock_mapping> }
+                     { <stock_mapping> { "|" <stock_mapping> } }
+                   "END STOCK"
+<stock_operation> ::= "RECEIVE" | "ISSUE" | "ALLOCATE" | "TRANSFER"
+<stock_mapping> ::= <stock_role> <expression>
+<stock_role>    ::= "LINES" | "ITEM" | "QTY" | "UOM"
+                  | "PACK_UOM" | "PACK_QTY" | "DATE" | "DOC"
+                  | "WAREHOUSE" | "FROM_WAREHOUSE" | "TO_WAREHOUSE"
+                  | "COST" | "LOT" | "TYPE" | "TYPE_OUT" | "TYPE_IN"
+                  | "DEMAND" | "LOTS" | "RESULT"
+<break_stmt>    ::= "BREAK"
+<continue_stmt> ::= "CONTINUE"
+
+<assignments>   ::= <field> "=" <expression>
+                     { "," <field> "=" <expression> }
+<where_clause>  ::= <field> <cmp_op> <expression>
+                     { "AND" <field> <cmp_op> <expression> }
+<cmp_op>        ::= "=" | "!=" | "<>" | ">" | ">=" | "<" | "<="
+
+-- Expressions --
+
+<expression> ::= <or_expr>
+<or_expr>    ::= <and_expr> { "OR" <and_expr> }
+<and_expr>   ::= <not_expr> { "AND" <not_expr> }
+<not_expr>   ::= ["NOT"] <cmp_expr>
+<cmp_expr>   ::= <add_expr> [ <cmp_op> <add_expr> ]
+               | <add_expr> "IS" ["NOT"] "NULL"
+<add_expr>   ::= <mul_expr> { ("+" | "-") <mul_expr> }
+<mul_expr>   ::= <unary>    { ("*" | "/") <unary> }
+<unary>      ::= ["-"] <primary>
+<primary>    ::= <literal> | <identifier> | <dotted_ref>
+               | <func_call> | "(" <expression> ")"
+
+<literal>    ::= <number> | <quoted_str> | "TRUE" | "FALSE" | "NULL"
+<identifier> ::= <name>
+<dotted_ref> ::= <name> "." <name>
+<func_call>  ::= <func_name> "(" [ <expression> { "," <expression> } ] ")"
+
+<func_name>  ::= ADD | SUB | COUNT | SUM | SUMIF
+               | MIN | MAX | ABS | ROUND | CEIL | FLOOR | DIV
+               | TODAY | NOW | ISNULL | ISBLANK | STR | NUM
+               | UPPER | LOWER | LEN | REPLACE | LPAD | TRIM
+               | LEFT | RIGHT | CONCAT
+               | DATEDIFF | DATEADD | YEAR | MONTH | DAY
+               | QUARTER | YEARMONTH | DAYOFWEEK
+               | LOOKUPVALUE | LOOKUPRANGE | LOOKUPSTEP
+               | FIFOOUT | COUNTROWS
+               | BOMEXPLODE | BOMROLLUP
+
+  -- Math --
+    ADD(a, b)        -- addition (same as a + b)
+    SUB(a, b)        -- subtraction (same as a - b)
+    MIN(a, b)        -- minimum of two values
+    MAX(a, b)        -- maximum of two values
+    ABS(n)           -- absolute value
+    ROUND(n [, d])   -- round to d decimal places (default 0)
+    CEIL(n)          -- round up to nearest integer
+    FLOOR(n)         -- round down to nearest integer
+    DIV(a, b)        -- safe division (returns 0 if b is 0)
+
+  -- String --
+    STR(v)           -- convert to string
+    NUM(v)           -- convert to number
+    UPPER(s)         -- uppercase string
+    LOWER(s)         -- lowercase string
+    LEN(v)           -- length of string or list
+    TRIM(s)          -- strip leading/trailing whitespace
+    REPLACE(s, old, new) -- replace all occurrences
+    LPAD(v, width [, char]) -- left-pad with char (default "0")
+    LEFT(s, n)       -- first n characters
+    RIGHT(s, n)      -- last n characters
+    CONCAT(a, b, ..) -- join all arguments into one string
+
+  -- Date --
+    TODAY()          -- current date as "YYYY-MM-DD"
+    NOW()            -- current datetime as ISO string
+    DATEDIFF(d1, d2) -- days between d1 and d2 (d1 - d2)
+    DATEADD(d, n)    -- add n days to date, returns "YYYY-MM-DD"
+    YEAR(d)          -- extract year as integer
+    MONTH(d)         -- extract month (1-12) as integer
+    DAY(d)           -- extract day (1-31) as integer
+    QUARTER(d)       -- quarter (1-4) from date
+    YEARMONTH(d)     -- returns "YYYY-MM" string
+    DAYOFWEEK(d)     -- 1=Monday .. 7=Sunday
+
+  -- Boolean / Null --
+    ISNULL(v)        -- true if v is null or empty
+    ISBLANK(v)       -- true if v is null or blank string
+
+  -- Aggregation --
+    COUNT(list)      -- number of items in a list
+    SUM(list, field) -- sum a field across list items
+    SUMIF(list, sum_field, cond_field, cond_value)
+                     -- sum field only for rows where cond_field = cond_value
+    COUNTROWS(table, key_field, key_value)
+                     -- count rows in DB table matching key
+
+  -- Lookup --
+    LOOKUPVALUE(table, return_field, match_field, match_value)
+                     -- find first row where match_field=match_value,
+                        return its return_field value
+    LOOKUPRANGE(table, return_field, range_field, value [, key_field, key_value])
+                     -- find row with highest range_field <= value,
+                        return its return_field. For price tiers/brackets.
+                        Optional key_field/key_value to filter rows.
+    LOOKUPSTEP(table, return_field, step_field, value [, key_field, key_value])
+                     -- alias for LOOKUPRANGE (stepped pricing/tax brackets)
+
+  -- Inventory / BOM --
+    FIFOOUT(table, qty_field, sort_field, deduct_qty, key_field, key_value)
+                     -- FIFO deduction from a lot/batch table.
+                        Rows matching key_field=key_value are sorted
+                        ascending by sort_field (oldest first). Qty is
+                        consumed row by row. Fully consumed rows are
+                        deleted. Returns remaining shortage (0 = OK).
+                        Sets context variables:
+                          _fifo_total_cost  — sum of (qty * unit_cost)
+                          _fifo_avg_cost    — weighted average cost
+    BOMEXPLODE(model_no, qty)
+                     -- recursively explode BOM into flat material list
+    BOMROLLUP(model_no, qty)
+                     -- aggregate exploded BOM by part_no
+
+-- Script Execution Context --
+
+Scripts execute with this context:
+    <header fields>    bare name resolves to current record fields
+    lines              list of detail rows (child grid data)
+    id                 current record rowid
+    <var>              variables set by SET/FETCH/FOREACH
+
+Dotted references:
+    line.field_name    access current loop item field
+    item.field_name    access a FETCHed record's field
+    rec._rowid         internal rowid of a FETCHed record
+
+Special:
+    _last_rowid        rowid of the most recent INSERT
+
+-- Mapped STOCK operations --
+
+  STOCK maps document fields to the inventory engine. ITEM and QTY are
+  required. LINES iterates a detail collection and binds each row as line.
+  Multiple mappings may be placed on one row with | separators.
+
+    STOCK ISSUE
+      LINES lines | ITEM line.part_no | QTY line.issue_qty | UOM line.uom
+      DATE issue_date | DOC issue_no | WAREHOUSE warehouse
+    END STOCK
+
+  RECEIVE increases on-hand and creates a lot and receipt stock card.
+  ISSUE consumes lots FIFO, decreases on-hand, and writes an issue card.
+  ALLOCATE changes allocated/back-order demand without moving on-hand.
+  TRANSFER moves lot quantity between warehouses without changing total stock.
+  REVERSE applies the corresponding inverse operation.
+  RESULT stores converted base quantity in a script variable.
+
+-- SUBROUTINE block (global reusable scripts) --
+
+<subroutine> ::= "SUBROUTINE" <name> "(" [<param> {"," <param>}] ")"
+                 <script_body>
+                 "ENDSUBROUTINE"
+
+    Subroutines are defined at the top level (outside any FORM).
+    They are callable from any form's SCRIPT via CALL with arguments.
+    Parameters are bound as local variables during execution and
+    cleaned up after the subroutine returns.
+
+    Example:
+      SUBROUTINE stock_recalc(rowid, delta)
+        FETCH item FROM item WHERE _rowid = rowid
+        SET new_oh = item.on_hand + delta
+        SET demand = item.allocated + item.back_order
+        SET new_alloc = MIN(new_oh, demand)
+        SET new_bo = demand - new_alloc
+        SET new_avail = new_oh - new_alloc
+        UPDATE item SET on_hand = new_oh, allocated = new_alloc,
+                       back_order = new_bo, available = new_avail
+                   WHERE _rowid = rowid
+      ENDSUBROUTINE
+
+    Called from a SCRIPT:
+      CALL stock_recalc(item._rowid, line.received_qty)
+      CALL stock_recalc(item._rowid, 0 - line.issue_qty)
+
+-- WORKFLOW block --
+
+<workflow_block> ::= "WORKFLOW" "ON" <status_field>
+                     <transition>+
+                     "END" "WORKFLOW"
+
+<transition> ::= <from_status> ">" <to_status> ":" <script_name>
+
+    Status transitions reference SCRIPT blocks defined in the
+    same FORM. When the user presses F5 (Post), valid transitions
+    for the current status are shown. Selecting one executes the
+    named script and changes the status field.
+
+    If a transition references a script that does not exist, only
+    the status change is performed (no script execution).
+
+-- ON SAVE block (legacy posting-step syntax) --
+
+<on_save_block> ::= "ON" "SAVE"
+                    <posting_step>*
+                    "END" "SAVE"
+
+<posting_step> ::= <for_each> | <find> | <update_legacy>
+                 | <if_legacy> | <write>
+
+<for_each>      ::= "FOR" "EACH" <detail_name>
+                     <posting_step>*
+                     "END" "FOR"
+<find>          ::= "FIND" <table> "BY" <field>
+                     ["OF" <parent_table> "USING" <link_field>]
+<update_legacy> ::= "UPDATE" <table.field> ("+=" | "-=" | "=") <expr>
+<if_legacy>     ::= "IF" <scope.field>
+                     <posting_step>*
+                     "END" "IF"
+<write>         ::= "WRITE" <table>
+                     ( <field> "=" <expr> )*
+                     "END" "WRITE"
+
+<expr>          ::= <scope.field> | <quoted_str> | <number> | "TODAY"
+<scope>         ::= "header" | "line" | <found_table>
+
+-- MENU block --
+
+<menu> ::= "MENU" <quoted_str> ["PULLDOWN"]
+           ( <group> )*
+           "END"
+
+  Without PULLDOWN keyword: center-based menu (default).
+  With PULLDOWN: top-bar pulldown menus.
+
+<group> ::= "GROUP" <quoted_str>
+            ( <menu_item> | "---" )*
+            "END"
+
+<menu_item> ::= <quoted_str> "=>" <target> ["HOTKEY" <key>]
+
+<target> ::= <name>          -- opens listing (list_<name> layout; F3 to add new)
+           | <name>.list     -- opens listing (same as bare name)
+           | <name>.add      -- opens add form directly (add_<name> layout)
+           | "report:" <name> -- runs a named REPORT
+           | REPORTS         -- opens report browser (lists all reports)
+           | EXIT            -- exits application
+           | RESET           -- triggers data reset
+           | SWITCH          -- opens company/database switcher
+
+-- RESET block --
+
+<reset_block> ::= "RESET"
+                  <reset_directive>*
+                  "END" "RESET"
+
+<reset_directive> ::= "CLEAR" <table> { "," <table> }
+                    | "UPDATE" <table> "SET" <field> "=" <value>
+                                          { "," <field> "=" <value> }
+
+    CLEAR deletes all rows from listed tables.
+    UPDATE sets fields to specified values on all rows.
+    Tables not mentioned are preserved intact.
+
+-- REPORT block --
+
+<report> ::= "REPORT" <name> "TITLE" <quoted_str>
+             <report_body>
+             "END REPORT"
+
+<report_body> ::= ( <source> | <order> | <where_clause>
+                  | <params_block> | <columns_block>
+                  | <group_line> | <totals_line>
+                  | <crosstab_block> )*
+
+<source>       ::= "SOURCE" <table_name>
+<order>        ::= "ORDER" <field> ["DESC"] { "," <field> ["DESC"] }
+<where_clause> ::= "WHERE" <expression>
+
+<params_block> ::= "PARAMS"
+                   ( <param_field> )*
+                   "END PARAMS"
+<param_field>  ::= <id> "|" <label> "|" [<width>] "|" [<flags>]
+
+<columns_block> ::= "COLUMNS"
+                    ( <report_col> )*
+                    "END COLUMNS"
+<report_col>    ::= <id> "|" <label> "|" <width> "|" [<col_flags>]
+<col_flags>     ::= "num" | "sum" | "formula:<expr>"
+
+<group_line>   ::= "GROUP" <field> ["HEADER" <quoted_str>]
+<totals_line>  ::= "TOTALS" <field> { "," <field> }
+
+<crosstab_block> ::= "CROSSTAB"
+                     "ROW" <field>
+                     "COL" <field>
+                     "VALUE" <field>
+                     ["AGG" ("sum"|"count"|"avg")]
+                     ["ROW_TOTAL" ("true"|"false")]
+                     ["COL_TOTAL" ("true"|"false")]
+                     "END CROSSTAB"
+
+  Reports support three views:
+    F2 Listing  — detail rows with group headers and subtotals
+    F3 Summary  — aggregated by first group field
+    F6 Crosstab — pivot table (if CROSSTAB defined)
+    F10 PDF     — export current view to PDF
+
+-- ENTRY mode --
+
+<form_entry> ::= "FORM" <name> "TITLE" <quoted_str> "ENTRY"
+
+  ENTRY mode creates a full-screen grid-only form (no header fields).
+  All fields are defined as detail columns. The grid fills the
+  entire screen. Used for simple data entry like quick stock issues.
+
+-- Document numbering --
+
+  prefix:<str>             -- sequential: PREFIX-NNNNN
+  prefix:<str>:YYMM        -- monthly: PREFIX-YYMMNNNNN
+
+  Examples:
+    prefix:CUS              → CUS-00001, CUS-00002
+    prefix:PO:YYMM          → PO-260700001 (July 2026)
+
+-- Auto-generated names --
+
+Given: FORM foo TITLE "Foo Title"
+
+  Form ID:      foo_form
+  Grid ID:      foo_grid
+  Add layout:   add_foo
+  List layout:  list_foo
+  Actions:      goto_foo_add, goto_foo_list, goto_foo (= list)
+
+Given: DETAIL "Lines" AS foo_line
+
+  Form ID:      foo_line_form
+  Grid ID:      foo_line_grid
+
+-- Comments --
+
+// single-line comments
+
+-- Database Storage --
+
+All data stored as JSON blobs: each table has (data TEXT).
+Detail rows include "_parent_rowid" linking to parent record.
+rowid is the SQLite internal row identifier.
+
+
+==============================================================
+KEYBOARD REFERENCE
+==============================================================
+
+Main Menu:
+  Arrow keys     Navigate center menu / pulldown menus
+  Enter          Select menu item
+  F2-F4          Hotkeys (as defined in DSL)
+  ESC            Exit / go back
+
+Form View:
+  Tab / S-Tab    Next / previous field
+  F4             Open lookup dialog on lookup fields
+  F5             Post / workflow action (when WORKFLOW defined)
+  F10 / Ctrl+S   Save record
+  ESC            Cancel and go back
+  Ins            Insert new row in detail grid
+  Ctrl+D         Delete row in detail grid
+  Ctrl+U         Toggle detail row between base UOM and pack UOM
+
+List View:
+  Arrow keys     Navigate rows
+  Enter          Edit selected record
+  F3             New record
+  F6             Sort picker
+  F7             Toggle filter row (Tab/Shift+Tab between columns)
+  F8             Column configuration
+  Ctrl+D         Delete selected record
+  ESC            Go back (or hide filter row if active)
+
+Report View:
+  Arrow keys     Navigate rows
+  F2             Switch to listing view
+  F3             Switch to summary view
+  F4             Re-run report (re-enter params)
+  F6             Switch to crosstab view
+  F10            Export to PDF
+  ESC            Back
+
+Numeric keypad Enter is supported everywhere.
+
+
+==============================================================
+COMPARISON EXAMPLE
+==============================================================
+
+VERBOSE (14 lines):
+  FORM "po_form"
+    FIELD "po_number" TYPE STRING REQUIRED LEN 12 PREFIX "PO"
+    FIELD "vendor_code" TYPE STRING LEN 10 LOOKUP "vendor"
+  END FORM
+  GRID "po_grid" BELONGS_TO "po_form"
+    COLUMN "po_number" TYPE STRING WIDTH 12
+    COLUMN "vendor_code" TYPE STRING WIDTH 10
+  END GRID
+  LAYOUT "add_po" TITLE "Purchase Order" POSITION 0 0 WIDTH 80 HEIGHT 24 BORDER 1
+    FORM "po_form" Y=3 X=2
+  END LAYOUT
+  ACTION "goto_po_add" GOTO "add_po"
+
+COMPACT (5 lines):
+  FORM po TITLE "Purchase Order"
+    po_number   | 12 | req prefix:PO
+    vendor_code | 10 | lookup:vendor
+    LIST po_number:12 vendor_code:10
+  END
+
+
+==============================================================
+SCRIPT ENGINE EXAMPLE
+==============================================================
+
+// Global subroutine — callable from any form
+SUBROUTINE stock_recalc(rowid, delta)
+  FETCH _sr_item FROM item WHERE _rowid = rowid
+  SET _sr_oh = _sr_item.on_hand + delta
+  SET _sr_demand = _sr_item.allocated + _sr_item.back_order
+  SET _sr_alloc = MIN(_sr_oh, _sr_demand)
+  SET _sr_bo = _sr_demand - _sr_alloc
+  SET _sr_avail = _sr_oh - _sr_alloc
+  UPDATE item SET on_hand = _sr_oh, allocated = _sr_alloc,
+                 back_order = _sr_bo, available = _sr_avail
+             WHERE _rowid = rowid
+ENDSUBROUTINE
+
+FORM grn TITLE "Goods Receipt" COLS 2
+  ...
+  DETAIL "Receipt Lines" AS grn_line TOTALS
+    part_no      | 12 | lookup:item fill:part_name
+    received_qty | 12 | num
+    lot_no       | 12 |
+    unit_cost    | 12 | num
+    amount       | 14 | num formula:received_qty*unit_cost
+  END DETAIL
+
+  SCRIPT post
+    FOREACH line IN lines
+      FETCH item FROM item WHERE part_no = line.part_no
+      CALL stock_recalc(item._rowid, line.received_qty)
+      IF po_number
+        UPDATE item SET on_order = item.on_order - line.received_qty
+                    WHERE _rowid = item._rowid
+        FETCH po_rec FROM po WHERE po_number = po_number
+        FETCH po_ln FROM po_line
+              WHERE part_no = line.part_no
+                AND _parent_rowid = po_rec._rowid
+        UPDATE po_line SET received_qty = po_ln.received_qty
+                                        + line.received_qty
+                       WHERE _rowid = po_ln._rowid
+      END
+      INSERT item_lot SET entry_date = grn_date,
+                          doc_no = grn_no,
+                          lot_no = line.lot_no,
+                          warehouse = warehouse,
+                          on_hand = line.received_qty,
+                          uom = item.uom,
+                          unit_cost = line.unit_cost,
+                          _parent_rowid = item._rowid
+      FETCH item FROM item WHERE _rowid = item._rowid
+      INSERT item_card SET trans_date = grn_date,
+                           trans_type = "RECV",
+                           doc_no = grn_no,
+                           receive_qty = line.received_qty,
+                           issue_qty = 0,
+                           balance = item.on_hand,
+                           unit_cost = line.unit_cost,
+                           _parent_rowid = item._rowid
+    END
+  ENDSCRIPT
+
+  SCRIPT void
+    FOREACH line IN lines
+      FETCH item FROM item WHERE part_no = line.part_no
+      CALL stock_recalc(item._rowid, 0 - line.received_qty)
+      DELETE item_lot WHERE doc_no = grn_no AND _parent_rowid = item._rowid
+      FETCH item FROM item WHERE _rowid = item._rowid
+      INSERT item_card SET trans_date = grn_date,
+                           trans_type = "VOID-R",
+                           doc_no = grn_no,
+                           receive_qty = 0,
+                           issue_qty = line.received_qty,
+                           balance = item.on_hand,
+                           _parent_rowid = item._rowid
+    END
+  ENDSCRIPT
+
+  WORKFLOW ON status
+    Draft > Posted : post
+    Posted > Void : void
+  END WORKFLOW
+  ...
+END
+
+
+==============================================================
+FIFO ISSUE EXAMPLE
+==============================================================
+
+// Issue slip using FIFOOUT for lot consumption and FIFO costing
+
+  SCRIPT post
+    FOREACH line IN lines
+      FETCH item FROM item WHERE part_no = line.part_no
+      SET short = FIFOOUT("item_lot", "on_hand", "entry_date",
+                          line.issue_qty, "_parent_rowid", item._rowid)
+      CALL stock_recalc(item._rowid, 0 - line.issue_qty)
+      FETCH item FROM item WHERE _rowid = item._rowid
+      INSERT item_card SET trans_date = issue_date,
+                           trans_type = "ISSUE",
+                           doc_no = issue_no,
+                           issue_qty = line.issue_qty,
+                           balance = item.on_hand,
+                           unit_cost = _fifo_avg_cost,
+                           _parent_rowid = item._rowid
+    END
+  ENDSCRIPT
