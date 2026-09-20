@@ -867,6 +867,20 @@ class SearchDialog:
         filtered = list(data)
         result = None
 
+        # Fields that are identity/system keys — excluded from auto-confirm check
+        _ID_SUFFIXES = ("_id", "_uuid", "_unid", "_uid", "_rowid")
+        _ID_NAMES    = {"id", "uuid", "unid", "uid", "rowid", "_parent_rowid"}
+
+        def _is_identity_field(k):
+            if k in _ID_NAMES:
+                return True
+            kl = k.lower()
+            if any(kl.endswith(s) for s in _ID_SUFFIXES):
+                return True
+            if "uuid" in kl or "unid" in kl:
+                return True
+            return False
+
         # Pre-select current value
         if current_value is not None:
             for i, row in enumerate(filtered):
@@ -888,6 +902,24 @@ class SearchDialog:
                                    if k not in ("rowid", "_parent_rowid"))]
             cur = 0
             scroll = 0
+
+        def _auto_confirm_single():
+            """Return True and set result if exactly one match on non-identity fields."""
+            nonlocal result
+            if len(filtered) != 1 or not search:
+                return False
+            row = filtered[0]
+            term = search.lower()
+            # Check if match is on at least one meaningful (non-identity) field
+            meaningful_match = any(
+                term in str(v).lower()
+                for k, v in row.items()
+                if not _is_identity_field(k)
+            )
+            if meaningful_match:
+                result = row
+                return True
+            return False
 
         while True:
             popup.erase()
@@ -1070,6 +1102,8 @@ class SearchDialog:
             elif 32 <= key <= 126:
                 search += chr(key)
                 _filter()
+                if _auto_confirm_single():
+                    break
 
         # Clean up
         try:
