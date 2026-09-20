@@ -395,6 +395,12 @@ class LayoutRenderer:
                     widget = LookupField(y, wx, lookup_w, ldata,
                                          display_field=df, value_field=vf,
                                          list_columns=lcols)
+                    # Store full data backup for CASCADE re-filtering
+                    widget._all_lookup_data = list(ldata)
+                    # Attach cascade metadata: "source_widget->filter_field"
+                    cascade = field.get("lookup_cascade")
+                    if cascade:
+                        widget._cascade = cascade
                     # Attach explicit fill mapping if lookupfill is a dict
                     lfill = field.get("lookupfill")
                     if isinstance(lfill, dict):
@@ -441,6 +447,7 @@ class LayoutRenderer:
                 row_offset += extra_rows
         self._wire_item_master_auto_conversion()
         self._wire_formula_fields()
+        self._wire_cascade_lookups()
 
     def _widget_map(self) -> Dict[str, BaseWidget]:
         return {
@@ -515,6 +522,57 @@ class LayoutRenderer:
             widget.load(value)
         else:
             widget.set_value(value)
+
+    def _wire_cascade_lookups(self):
+        """Wire CASCADE lookup filtering: when source widget changes, filter target lookup data.
+
+        DSL syntax: lookup:city CASCADE state->state_code
+        Meaning: filter city lookup where city.state_code == value of 'state' widget.
+        """
+        widget_map = self._widget_map()
+
+        for w in self.widgets:
+            cascade = getattr(w, '_cascade', None)
+            if not cascade or not isinstance(w, LookupField):
+                continue
+            # Parse "source_field->filter_field_in_lookup"
+            if '->' not in cascade:
+                continue
+            source_id, filter_field = cascade.split('->', 1)
+            source_id = source_id.strip()
+            filter_field = filter_field.strip()
+            source_widget = widget_map.get(source_id)
+            if not source_widget:
+                continue
+
+            target_widget = w  # the LookupField with CASCADE
+
+            def make_filter(target, ff):
+                def _apply_cascade(val):
+                    all_data = getattr(target, '_all_lookup_data', target.lookup_data)
+                    if val:
+                        filtered = [r for r in all_data if str(r.get(ff, "")) == str(val)]
+                    else:
+                        filtered = list(all_data)
+                    target.lookup_data = filtered
+                    # Clear current value if it no longer matches
+                    if target.value and not any(
+                        r.get(target.value_field) == target.value for r in filtered
+                    ):
+                        target.set_value("")
+                return _apply_cascade
+
+            old_on_change = source_widget.on_change
+            filter_fn = make_filter(target_widget, filter_field)
+
+            def make_chain(old, new):
+                def chained(val):
+                    if old:
+                        old(val)
+                    new(val)
+                return chained
+
+            source_widget.on_change = make_chain(old_on_change, filter_fn)
 
     def _is_item_master_layout(self) -> bool:
         widget_ids = set(self._widget_map())

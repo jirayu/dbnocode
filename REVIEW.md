@@ -19,6 +19,22 @@ Firebird. All screens are generated from the DSL — no application code require
 These were previously listed as open defects and have since been resolved
 (verified in the current tree):
 
+- **Excel-to-app bootstrap** - `.xlsx`/`.xlsm` worksheets can generate
+  validated compact DSL and preloaded JSON-row SQLite data through
+  `main.py --import-excel` or the injected main-menu action. Generated forms use
+  the classic `FORM` list + add/edit layout (no `TABBED`), so imported sheets
+  look and behave like the app's existing screens without requiring tab
+  switching. Every worksheet column becomes a grid column (scroll horizontally
+  to reach the rest), non-Latin headers keep their native script, and
+  re-importing existing forms asks to Replace or Stop first.
+  `System → Delete Imported Excel` lists registered imports and removes a
+  picked one (unregister + delete sidecar + drop its data tables).
+  Importing from the **System → Import Excel** action of a running app registers
+  the generated forms (`<script>.imports.json`) and seeds the workbook rows into
+  that app's own database; the forms are merged into its menu on the next
+  launch. Field lines are no longer confused with compact block headers, so
+  sheets containing columns such as `stock` or `detail` import cleanly.
+
 - **Unicode/terminal crash** — `locale.setlocale(locale.LC_ALL, "")` is now set
   in `ScriptRunner.run()` before `curses.wrapper` (`dsl_lib/runner.py`), so
   box/arrow glyphs no longer raise `UnicodeEncodeError` on stock locales.

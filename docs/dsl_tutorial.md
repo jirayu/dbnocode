@@ -14,6 +14,33 @@ Python/curses application bound to a database. This tutorial uses the
 `--validate-only` checks syntax + semantics and exits (no TUI). If you see
 `Valid: N forms, M grids`, your script parsed.
 
+To bootstrap an application from an Excel workbook, import it once and run the
+generated compact DSL:
+
+    python main.py --import-excel inventory.xlsx
+    python main.py scripts/inventory.dsl
+
+Each worksheet table becomes a classic CRUD form backed by a preloaded local
+SQLite database — the same list/form layout as hand-authored forms, so no
+tab-strip navigation is involved. The browse list is searchable: Enter edits the
+selected row, F3 creates a row, and Ctrl+D deletes it. Each row opens into the
+normal F10 form editor.
+
+You can also import into an app you are already running: open the **System** →
+**Import Excel** menu action and type the workbook path. When the app has a host
+script and a reachable database, the importer stores the generated forms beside
+that script (in `<script>.imports/`), registers them in `<script>.imports.json`,
+and seeds the workbook rows into the app's own database. On the next launch the
+forms appear under an **Imported Excel** menu section alongside your existing
+screens — the workbook becomes part of the same build, not a separate app.
+Re-importing a workbook whose forms already exist asks whether to replace them
+or stop first, so an existing form is never overwritten by accident. When an
+import turns out wrong, use **System → Delete Imported Excel** to pick it from
+the list: the sidecar is unregistered and deleted and its data tables are
+dropped.
+Without a host script or usable database (e.g. when launched ad hoc from an
+EXE), it falls back to generating a standalone project as above.
+
 > Tip: run your terminal in a UTF-8 locale so box-drawing glyphs render
 > correctly (see `REVIEW.md` for details).
 
@@ -46,12 +73,14 @@ browsable list. The parser auto-generates the screens/actions you need
 
 Syntax:  `field_id | width | flags`
 
-    part_no   | 12 | req prefix:ITM
-    part_name | 40 | req span:2
-    specs     | 50 | span:2 rows:3
-    category  |    | opts:Raw Material,Finished Good
-    on_hand   |    | num ro
-    cbm       |    | num default:0.10
+The `width` controls the UI input/display size only and does not limit the actual database field size. For text fields, the underlying storage uses appropriate types (TEXT, VARCHAR, etc.) that can accommodate variable-length data regardless of the specified width. Width may be blank for auto-sizing in lists.
+
+      part_no   | 12 | req prefix:ITM
+      part_name | 40 | req span:2
+      specs     | 50 | span:2 rows:3
+      category  |    | opts:Raw Material,Finished Good
+      on_hand   |    | num ro
+      cbm       |    | num default:0.10
 
 Flags:
 
@@ -68,9 +97,12 @@ Flags:
 | `default:val` | default value |
 | `opts:A,B,C` | dropdown options |
 | `lookup:form` | pick from another form |
+| `lookup:form INCLUDE f1,f2` | show only these columns in picker |
+| `lookup:form EXCLUDE f1,f2` | hide these columns from picker |
+| `lookup:form CASCADE src->field` | filter lookup by sibling field value (e.g. city filtered by selected state) |
 | `fill:...` | prefill from lookup |
 | `filter:k=v` | filter lookup rows |
-| `formula:...` | computed value (display only) |
+| `formula:...` | computed value (display only). Can include formatting functions like `FORMAT(CURRENCY, value)`. |
 | `readonly_below:N` | read-only unless user level >= N (fails safe to guest) |
 
 Width may be blank (auto-sized in the list).
@@ -85,7 +117,7 @@ Width may be blank (auto-sized in the list).
         on_hand   |    | num
       DETAIL "Stock Lots" AS item_lot
         lot_no    | 12 | ro
-        on_hand   | 10 | num ro
+        on_hand   |    | num ro
       END DETAIL
       LIST part_no:12 part_name:40 on_hand:10
     END
@@ -123,7 +155,8 @@ Python `eval`). It reads/writes tables by name:
       FETCH row FROM grn WHERE _rowid = header._rowid
       STOCK RECEIVE
         LINES lines | ITEM line.part_no | QTY line.qty | UOM line.uom
-        DATE grn_date | DOC grn_no | WAREHOUSE wh | COST line.cost
+        DATE grn_date | DOC grn_no | WAREHOUSE wh
+        COST line.unit_cost | LOT line.lot_no | TYPE "RECV"
       END STOCK
     ENDSCRIPT
 
@@ -146,15 +179,15 @@ Map document rows into the stock engine:
     END STOCK
 
 Operations: `RECEIVE | ISSUE | ALLOCATE | TRANSFER`; add `REVERSE` to undo.
-The engine does pack conversion, balance recalc, lot movement, and stock-card
-posting inside one transaction. `RESULT var` exposes the base qty.
+The engine does pack conversion, balance recalc, lot movement, and
+stroke-card posting inside one transaction. `RESULT var` exposes the base qty.
 
 ## 9. Generated screens & actions
 
 For `FORM foo` the runtime creates:
-`foo_form`, `foo_grid`, `add_foo`, `list_foo`,
-`goto_foo_add`, `goto_foo_list`, `goto_foo`.
-A detail `foo_line` adds `foo_line_form`, `foo_line_grid`.
+  `foo_form`, `foo_grid`, `add_foo`,
+  `list_foo`, `goto_foo_add`, `goto_foo_list`, and `goto_foo`.
+A detail `foo_line` adds `foo_line_form` and `foo_line_grid`.
 
 You rarely name these yourself — menus and `ON SAVE` reference them.
 
@@ -174,7 +207,7 @@ You rarely name these yourself — menus and `ON SAVE` reference them.
     END
 
 Targets: `name`, `name.list`, `name.add`, `EXIT`, `RESET`, `REPORTS`,
-`SETTINGS`, `SWITCH`, `report:name`, `B2B.INBOX`, `B2B.OUTBOX`.
+`SETTINGS`, `EXCEL.IMPORT`, `SWITCH`, `report:name`, `B2B.INBOX`, `B2B.OUTBOX`.
 (`GROUP` is an alias for `PULLDOWN`.)
 
 ## 11. ON SAVE / WRITE (auto-posting)
@@ -192,7 +225,6 @@ Targets: `name`, `name.list`, `name.add`, `EXIT`, `RESET`, `REPORTS`,
         END WRITE
         CALL post_grn()
       END SAVE
-    END
 
 `ON SAVE` runs after a successful header save. `WRITE child FROM lines`
 copies detail rows. `header` = saved parent record.

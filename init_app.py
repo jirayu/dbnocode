@@ -28,6 +28,7 @@ COPY_ENGINE = [
     'dsl_lib/__init__.py',
     'dsl_lib/adapters.py',
     'dsl_lib/compact_parser.py',
+    'dsl_lib/excel_importer.py',
     'dsl_lib/parser.py',
     'dsl_lib/report_engine.py',
     'dsl_lib/runner.py',
@@ -49,6 +50,9 @@ COPY_ENGINE = [
     'tui/widgets.py',
     # DSL documentation
     'docs/bnf_gramma.txt',
+    'docs/canonical_dsl.md',
+    'docs/dsl_tutorial.md',
+    'docs/grammar.ebnf',
     'docs/tutorial.txt',
 ]
 
@@ -119,6 +123,7 @@ def _gen_requirements() -> str:
     return '''\
 windows-curses>=2.3.0; sys_platform == "win32"
 reportlab>=4.0
+openpyxl>=3.1
 '''
 
 
@@ -143,6 +148,7 @@ def _gen_readme(cfg: dict) -> str:
 - **Run**: `run.bat` or `dsl_tui_app.exe scripts/my_app.dsl`
 - **Alt**: `python main.py scripts/my_app.dsl` (if Python installed)
 - **DB**: SQLite (auto-created on first run, local file)
+- **Excel import**: `python main.py --import-excel workbook.xlsx`
 - **Default**: No login required — app opens directly
 
 ## How to Create New Screens

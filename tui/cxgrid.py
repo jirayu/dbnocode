@@ -1005,9 +1005,12 @@ class Grid:
 
         rendered = []
         x = self.start_x + self.INDICATOR_W
+        right_limit = self.max_x - 1  # reserve 1 char for right frame border
 
         # Frozen columns first
         for ci, col in frozen:
+            if x + col.width > right_limit:
+                break
             rendered.append((ci, col, x, False))
             x += col.width + 1
 
@@ -1018,9 +1021,11 @@ class Grid:
             self._frozen_sep_x = -1
 
         # Scrollable columns from h_scroll_offset
+        # Reserve 1 char for the right frame border
+        right_limit = self.max_x - 1
         visible_scrollable = scrollable[self.h_scroll_offset:]
         for ci, col in visible_scrollable:
-            if x + col.width > self.max_x:
+            if x + col.width > right_limit:
                 break
             rendered.append((ci, col, x, True))
             x += col.width + 1

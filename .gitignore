@@ -14,6 +14,7 @@ dbnocode_settings.json
 print_config.json
 udf_schemas.json
 custom_options.json
+*.dsl.imports.json
 
 # Build artifacts
 dist/
@@ -32,6 +33,8 @@ lab/
 # AI tooling config (local only)
 .claude/
 .opencode/
+AGENTS.md
+CLAUDE.md
 
 # Temp / cache dirs
 .pytest_cache/

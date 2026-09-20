@@ -111,7 +111,39 @@ python main.py scripts/04_inventory_compact.dsl
 
 # Validate a script without launching the UI
 python main.py --validate-only scripts/04_inventory_compact.dsl
+
+# Turn an Excel workbook into a CRUD app and preload its SQLite data
+python main.py --import-excel inventory.xlsx
+python main.py scripts/inventory.dsl
 ```
+
+Excel import accepts `.xlsx` and `.xlsm`. Each detected worksheet table becomes a
+compact `FORM` declaration in the same classic layout as hand-authored forms: the
+**List** is searchable and supports Enter/F3/Ctrl+D, and each row opens into the
+normal F10 CRUD editor. The generated `.dsl` is written under `scripts/` and its
+database is written in the current directory. Use `--output path.dsl` or
+`--database path.db` to choose other destinations; existing output is protected
+unless `--force` is supplied.
+
+The importer recognizes conventional header rows, infers text/number/date
+fields from cell values and formats, preserves up to 5,000 rows per sheet, and
+also recognizes NocodeXL-style blue input and yellow display cells. If a styled
+header and a line-item table share a sheet, both are preserved as CRUD forms.
+Every worksheet column becomes a grid column (scroll horizontally to reach them
+all), and non-Latin headers keep their native script (Thai, CJK, Arabic).
+
+`Import Excel` is also added automatically to the main menu's **System**
+section. Enter or paste the workbook path in the dialog. When the app is running
+from a DSL script with a reachable database, the import registers the generated
+forms beside that script (`<script>.imports/` + `<script>.imports.json`) and
+seeds the workbook rows into the app's own database — the forms appear under an
+**Imported Excel** menu section on the next launch, part of the same app. If no
+host script or database is available it falls back to a standalone project and
+shows the command for opening it. Re-importing a workbook whose forms already
+exist asks whether to replace them or stop before anything is overwritten.
+**Delete Imported Excel** (main menu → **System**) lists every registered import
+and lets you remove one: it unregisters the sidecar, deletes the file, and drops
+that import's data tables.
 
 By default the app uses a local SQLite file — fully standalone, no server
 required. A remote/shared backend is optional (`server.py` / `FBServer.py`).

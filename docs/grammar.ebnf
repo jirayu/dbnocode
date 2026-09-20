@@ -4,7 +4,7 @@ datasource   = "DATASOURCE", quoted, "ADAPTER", adapter ;
 adapter      = "sqlite" | "postgres" | "firebird" ;
 top_level    = app | datasource | fieldset | form | menu | report | subroutine | reset ;
 fieldset     = "FIELDSET", name, { section | field }, "END FIELDSET" ;
-form         = "FORM", name, ["TITLE", quoted], ["COLS", integer],
+form         = "FORM", name, ["TITLE", quoted], ["COLS", integer], ["TABBED"],
                { use | section | field | detail | tree_detail | list | computed | udf |
                   highlight | script | workflow | on_save }, "END" ;
 use          = "USE", name, {",", name} ;
@@ -14,6 +14,8 @@ detail       = "DETAIL", quoted, "AS", name, ["TOTALS"], {column | prefill | coe
 tree_detail  = "TREE_DETAIL", quoted, "AS", name, {column}, "END TREE_DETAIL" ;
 column       = name, "|", [integer], "|", [flag, {flag}] ;
 list         = "LIST", name, ":", integer, {name, ":", integer} ;
+named_lookup_list = name [ ":" name ], {"," name [ ":" name ] } ;
+lookup_target = name { "|" name } ;
 computed     = "COMPUTED", {name, "=", expression}, "END COMPUTED" ;
 udf          = "UDF", quoted ;
 highlight    = "HIGHLIGHT", {expression, "|", name}, "END HIGHLIGHT" ;
@@ -33,16 +35,18 @@ workflow_action = "ACTION", quoted, ":", name ;
 on_save      = "ON SAVE", {posting_line}, "END SAVE" ;
 prefill      = "PREFILL", name, ["filter:", expression] ;
 coedit       = "COEDIT", name ;
-flag         = "req" | "num" | "date" | "ro" | "upper" | "prefix:", text |
-               "span:", integer | "rows:", integer | "default:", text |
-               "opts:", csv | "lookup:", name | "fill:", text |
-               "copydetail:", name | "filter:", text | "formula:", expression ;
+flag         = "req" | "num" | "date" | "time" | "timestamp" | "uuid" | "json" | "email" | "phone" |
+                "currency" | "percentage" | "color" | "ro" | "upper" | "prefix:", text |
+                "span:", integer | "rows:", integer | "default:", text |
+                "opts:", csv | "lookup:", lookup_target [ "INCLUDE" csv | "EXCLUDE" csv | "(" named_lookup_list ")" | "CASCADE" field "->" field ] |
+                "fill:", text | "copydetail:", name | "filter:", text | "formula:", expression ;
 menu         = "MENU", quoted, ["PULLDOWN" | "MAINMENU"], {group | center}, "END" ;
 group        = ("GROUP" | "PULLDOWN"), quoted, {menu_item | "---"}, "END" ;
 center       = "CENTER", {menu_item | "---"}, "END" ;
 menu_item    = quoted, "=>", target, ["HOTKEY", key] ;
 target       = name | name, ".list" | name, ".add" | "EXIT" | "RESET" |
-               "REPORTS" | "SETTINGS" | "SWITCH" | "report:", name ;
+               "REPORTS" | "SETTINGS" | "EXCEL.IMPORT" | "SWITCH" |
+               "report:", name ;
 report       = "REPORT", name, ["TITLE", quoted], {report_line}, "END REPORT" ;
 report_line  = "SOURCE", text | "ORDER", text | "WHERE", expression | columns |
                "GROUP", text | "TOTALS", text | crosstab ;
