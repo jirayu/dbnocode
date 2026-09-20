@@ -29,6 +29,9 @@ class ScriptRunner:
         self.company_name = ""    # current company display name
         self._lookups_dirty = False  # set True after save to trigger lookup reload
         self._tables_ensured = set()  # DB URLs/paths where tables already created
+        # In-memory cache for ENTRY-mode grids: (form_id, rowid_or_None) -> grid row list.
+        # Survives filter (F7) and navigation back to the same Draft; cleared on F10 save.
+        self._entry_grid_cache: Dict[tuple, list] = {}
         self._init_database()
         self._ensure_tables()
         self._load_column_configs()
@@ -729,6 +732,7 @@ class ScriptRunner:
                             else {})
         self._load_column_configs()
         self._bs_cache = None  # reload business settings from new DB
+        self._entry_grid_cache.clear()  # in-memory entry data belongs to old DB
 
     @staticmethod
     def _probe_server(db_url: str) -> bool:
@@ -3343,10 +3347,15 @@ class ScriptRunner:
             existing_rowid = self.edit_context.get("rowid")
             # Load existing header values
             header_values = dict(self.edit_context.get("data", {}))
-            # Load existing detail lines
-            data = self._load_grid_data(entry_grid_id, existing_rowid)
-            if not data:
-                data = []
+            # Check in-memory cache first (user navigated back to a Draft)
+            _cache_key = (entry_grid_id, existing_rowid)
+            cached = self._entry_grid_cache.get(_cache_key)
+            if cached is not None:
+                data = [dict(r) for r in cached]
+            else:
+                data = self._load_grid_data(entry_grid_id, existing_rowid)
+                if not data:
+                    data = []
             self.edit_context = None
         else:
             # ── Step 1: Popup dialog for header fields ──
@@ -3355,22 +3364,26 @@ class ScriptRunner:
                 return "__back__"
 
             # ── Step 2: Load prefill data ──
-            if prefill:
-                data = self._prefill_detail(entry_grid_id, prefill)
+            _cache_key = (entry_grid_id, None)
+            cached = self._entry_grid_cache.get(_cache_key)
+            if cached is not None:
+                data = [dict(r) for r in cached]
             else:
-                data = []
-
-            # Enrich with warehouse_storage balance if grid has wh_balance col
-            wh_bal_cols = [c for c in grid_def.get("columns", [])
-                          if c["id"] == "wh_balance"]
-            if wh_bal_cols and data and header_values.get("warehouse"):
-                wh_id = str(header_values["warehouse"]).strip()
-                wh_bal = self._aggregate_wh_balance(wh_id)
-                for row in data:
-                    pn = str(row.get("part_no", "")).strip()
-                    row["wh_balance"] = wh_bal.get(pn, 0)
-                # Filter out items with zero warehouse balance
-                data = [r for r in data if r.get("wh_balance", 0) > 0]
+                if prefill:
+                    data = self._prefill_detail(entry_grid_id, prefill)
+                else:
+                    data = []
+                # Enrich with warehouse_storage balance if grid has wh_balance col
+                wh_bal_cols = [c for c in grid_def.get("columns", [])
+                              if c["id"] == "wh_balance"]
+                if wh_bal_cols and data and header_values.get("warehouse"):
+                    wh_id = str(header_values["warehouse"]).strip()
+                    wh_bal = self._aggregate_wh_balance(wh_id)
+                    for row in data:
+                        pn = str(row.get("part_no", "")).strip()
+                        row["wh_balance"] = wh_bal.get(pn, 0)
+                    # Filter out items with zero warehouse balance
+                    data = [r for r in data if r.get("wh_balance", 0) > 0]
 
             if not data:
                 self._show_message(stdscr, "No items available")
@@ -3569,6 +3582,9 @@ class ScriptRunner:
             _start_edit()
 
         while True:
+            # Persist current grid state to in-memory cache (survives filter + navigation)
+            self._entry_grid_cache[_cache_key] = [dict(r) for r in grid.data]
+
             # ── Draw ──
             if need_full_redraw:
                 stdscr.clear()
@@ -3772,6 +3788,8 @@ class ScriptRunner:
                 if cfg != self.column_configs.get(entry_grid_id):
                     self.column_configs[entry_grid_id] = cfg
                     self._save_column_configs()
+                # Clear in-memory cache — data now committed to DB
+                self._entry_grid_cache.pop(_cache_key, None)
                 return "__saved__"
 
             # F5: workflow
@@ -3807,6 +3825,7 @@ class ScriptRunner:
                         header_values = self.edit_context.get("data", header_values)
                     self.edit_context = None
                     self._show_save_ok(stdscr)
+                self._entry_grid_cache.pop(_cache_key, None)
                 return "__saved__"
 
             # F7: filter
