@@ -2,6 +2,7 @@ import curses
 import json
 import os
 import sqlite3
+import sys
 from datetime import date
 from typing import Dict, Any, List
 from tui import LayoutRenderer
@@ -12,8 +13,9 @@ from dsl_lib.script_engine import ScriptExecutor, ScriptError
 
 
 class ScriptRunner:
-    def __init__(self, app_def: Dict[str, Any]):
+    def __init__(self, app_def: Dict[str, Any], db_override: str = None):
         self.app = app_def
+        self._db_override = db_override  # --db CLI arg bypasses company selection
         self.current_user = self._load_user_context()
         self.current_layout = None
         self.db = None
@@ -112,11 +114,24 @@ class ScriptRunner:
     def _init_database(self):
         """Initialize database adapter.
 
-        Priority: active company profile > DB_URL env var > DSL datasource.
+        Priority: --db override > active company profile > DB_URL env var > DSL datasource.
         Remote SQLite can fall back to local SQLite. Direct Firebird does not
         fall back because writing to a different local database could corrupt
         the user's company data workflow.
         """
+        # 0. CLI --db override (e.g. showcase mode) — bypass company selection
+        if self._db_override:
+            self.db = SQLiteAdapter(self._db_override)
+            self.db_connect_error = None
+            try:
+                self.db.connect()
+            except Exception as e:
+                self.db_connect_error = str(e)
+                self._log(e, context="db_override connect")
+            self._ensure_tables()
+            self.lookup_data = self._load_lookups() if not self.db_connect_error else {}
+            return
+
         # 1. Check active company profile first
         companies = self._load_companies()
         active = next((c for c in companies if c.get("active")), None)
@@ -281,7 +296,263 @@ class ScriptRunner:
 
     def _offline_safe_action(self, act_def: Dict[str, Any]) -> bool:
         """Allow only recovery/navigation actions when no DB is connected."""
-        return act_def.get("type") in {"switch", "exit"}
+        return act_def.get("type") in {"switch", "exit", "excel_import"}
+
+    def _prompt_text(self, stdscr, title: str, label: str,
+                     initial: str = "") -> str | None:
+        """Prompt for one arbitrary-length line inside a curses dialog."""
+        max_y, max_x = stdscr.getmaxyx()
+        height = 7
+        width = min(76, max(30, max_x - 4))
+        y = max(0, (max_y - height) // 2)
+        x = max(0, (max_x - width) // 2)
+        try:
+            win = curses.newwin(height, width, y, x)
+            win.keypad(True)
+        except curses.error:
+            return None
+
+        buffer = str(initial or "")
+        cursor = len(buffer)
+        input_width = max(8, width - 6)
+        try:
+            curses.curs_set(1)
+            while True:
+                win.erase()
+                win.border()
+                try:
+                    win.addstr(0, 2, f" {title} "[:width - 4], curses.A_BOLD)
+                    win.addstr(2, 2, label[:width - 4], curses.A_BOLD)
+                    offset = max(0, cursor - input_width + 1)
+                    visible = buffer[offset:offset + input_width]
+                    win.addstr(3, 2, visible.ljust(input_width), curses.A_REVERSE)
+                    win.addstr(height - 1, 2,
+                               " Enter/F10=Import  ESC=Cancel "[:width - 4],
+                               curses.A_DIM)
+                    win.move(3, 2 + min(cursor - offset, input_width - 1))
+                except curses.error:
+                    pass
+                win.refresh()
+                key = win.getch()
+                if key == 27:
+                    return None
+                if key in (curses.KEY_ENTER, 10, 13, curses.PADENTER,
+                           curses.KEY_F10, 19):
+                    return buffer.strip().strip('"') or None
+                if key in (curses.KEY_BACKSPACE, 127, 8) and cursor > 0:
+                    buffer = buffer[:cursor - 1] + buffer[cursor:]
+                    cursor -= 1
+                elif key == curses.KEY_DC and cursor < len(buffer):
+                    buffer = buffer[:cursor] + buffer[cursor + 1:]
+                elif key == curses.KEY_LEFT:
+                    cursor = max(0, cursor - 1)
+                elif key == curses.KEY_RIGHT:
+                    cursor = min(len(buffer), cursor + 1)
+                elif key == curses.KEY_HOME:
+                    cursor = 0
+                elif key == curses.KEY_END:
+                    cursor = len(buffer)
+                elif 32 <= key <= 126:
+                    buffer = buffer[:cursor] + chr(key) + buffer[cursor:]
+                    cursor += 1
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            stdscr.touchwin()
+            stdscr.refresh()
+
+    def _open_excel_import(self, stdscr):
+        """Import a workbook as forms of the running app's menu."""
+        workbook_value = self._prompt_text(
+            stdscr, "Import Excel", "Workbook path (.xlsx or .xlsm):")
+        if not workbook_value:
+            return
+        try:
+            from pathlib import Path
+            from dsl_lib.excel_importer import (
+                import_into_app, import_workbook, slugify)
+
+            source = Path(os.path.expandvars(
+                os.path.expanduser(workbook_value))).resolve()
+            host_script = self.app.get("_script_path")
+            db_usable = self.db is not None and (
+                not self.db_connect_error or self.is_fallback)
+            if host_script and db_usable:
+                from dsl_lib.excel_importer import (
+                    analyze_workbook, registered_form_names)
+                existing = set(registered_form_names(host_script))
+                existing |= {form_id[:-5] for form_id in self.app.get(
+                    "forms", {}) if form_id.endswith("_form")}
+                overlap = sorted(
+                    {form.name for form in analyze_workbook(source)} & existing)
+                if overlap:
+                    if not self._confirm_action(
+                            stdscr,
+                            "Replace existing " + ", ".join(overlap) + "?",
+                            title="Import Excel"):
+                        return
+                result = import_into_app(
+                    source, script_path=host_script, db=self.db)
+                self._show_multiline_popup(
+                    stdscr, "Excel Import Complete",
+                    f"Imported {result.forms} form(s) and {result.rows} "
+                    "row(s) into this app.\n\n"
+                    f"Definition: {result.script_path}\n\n"
+                    "The imported forms are added to this app's own menu and "
+                    "database on the next launch (exit and start it again).")
+                return
+
+            # No host script or unusable database: fall back to a standalone
+            # generated project with its own script and SQLite database.
+            app_slug = slugify(source.stem, "excel_app")
+            script_path = (Path("scripts") / f"{app_slug}.dsl").resolve()
+            database_path = Path(f"{app_slug}.db").resolve()
+            existing = [path for path in (script_path, database_path)
+                        if path.exists()]
+            force = False
+            if existing:
+                names = ", ".join(path.name for path in existing)
+                if not self._confirm_action(
+                        stdscr, f"Replace existing {names}?",
+                        title="Import Excel"):
+                    return
+                force = True
+            result = import_workbook(
+                source, script_path=script_path,
+                database_path=database_path, force=force)
+            command = (f'dsl_tui_app.exe "{result.script_path}"'
+                       if getattr(sys, "frozen", False)
+                       else f'python main.py "{result.script_path}"')
+            self._show_multiline_popup(
+                stdscr, "Excel Import Complete",
+                f"Imported {result.forms} form(s) and {result.rows} row(s).\n\n"
+                f"DSL: {result.script_path}\n"
+                f"Database: {result.database_path}\n\n"
+                "Exit this application, then run:\n"
+                f"{command}")
+        except Exception as exc:
+            self._show_multiline_popup(
+                stdscr, "Excel Import Failed", str(exc))
+
+    def _delete_imported_excel(self, stdscr):
+        """Screen to remove a registered Excel import and its data."""
+        from pathlib import Path
+        from dsl_lib.excel_importer import list_registered_imports
+
+        host_script = self.app.get("_script_path")
+        if not host_script or not Path(host_script).exists():
+            self._show_multiline_popup(
+                stdscr, "Delete Imported Excel",
+                "This app has no host DSL script, so no Excel imports are "
+                "registered.")
+            return
+
+        while True:
+            imports = list_registered_imports(host_script)
+            if not imports:
+                self._show_multiline_popup(
+                    stdscr, "Delete Imported Excel",
+                    "No imported Excel forms are registered for this app.")
+                return
+
+            sel, top = 0, 0
+            while True:
+                max_y, max_x = stdscr.getmaxyx()
+                vis_items = max(1, (max_y - 5) // 2)
+                stdscr.erase()
+                try:
+                    stdscr.addstr(0, 0, " " * max_x,
+                                  curses.A_REVERSE | curses.A_BOLD)
+                    stdscr.addstr(0, 1, " Delete Imported Excel ",
+                                  curses.A_REVERSE | curses.A_BOLD)
+                    stdscr.addstr(1, 0,
+                                  "  Pick an import to remove. "
+                                  f"{len(imports)} registered. "
+                                  "Enter = delete, Esc = back.")
+                except curses.error:
+                    pass
+                for off, item in enumerate(imports[top:top + vis_items]):
+                    y = 3 + off * 2
+                    stem = Path(item["stored"]).stem
+                    forms = ", ".join(item["forms"]) if item["forms"] else (
+                        item["error"] or "(no forms)")
+                    attr = (curses.A_REVERSE if top + off == sel
+                            else curses.A_NORMAL)
+                    try:
+                        stdscr.addstr(
+                            y, 2, f"{top + off + 1}. {stem}"[:max_x - 4], attr)
+                        stdscr.addstr(
+                            y + 1, 4, f"{forms}"[:max_x - 6], attr)
+                    except curses.error:
+                        pass
+                hint = "Enter:delete  Esc:back"
+                try:
+                    stdscr.addstr(max_y - 1,
+                                  max(2, max_x - len(hint) - 2),
+                                  hint, curses.A_DIM)
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key == curses.KEY_UP and sel > 0:
+                    sel -= 1
+                    if sel < top:
+                        top = sel
+                elif key == curses.KEY_DOWN and sel < len(imports) - 1:
+                    sel += 1
+                    if sel >= top + vis_items:
+                        top = sel - vis_items + 1
+                elif key == 27:
+                    stdscr.touchwin()
+                    stdscr.refresh()
+                    return
+                elif key in (10, 13, curses.KEY_ENTER, curses.PADENTER):
+                    self._remove_import_entry(stdscr, host_script,
+                                              imports[sel], count=len(imports))
+                    break
+                elif ord('1') <= key <= ord('9'):
+                    idx = key - ord('1')
+                    if idx < len(imports):
+                        self._remove_import_entry(
+                            stdscr, host_script, imports[idx],
+                            count=len(imports))
+                        break
+
+    def _remove_import_entry(self, stdscr, host_script, item, count):
+        """Unregister one import, delete its sidecar, drop its tables."""
+        from pathlib import Path
+        from dsl_lib.excel_importer import (
+            drop_import_tables, unregister_import)
+
+        stem = Path(item["stored"]).stem
+        forms = ", ".join(item["forms"]) or "(unreadable sidecar)"
+        if not self._confirm_action(
+                stdscr,
+                f"Delete {stem} ({forms})?",
+                title=f"Delete Imported Excel ({count} registered)"):
+            return
+        errors = []
+        sidecar = unregister_import(host_script, item["stored"])
+        if sidecar and sidecar.exists():
+            try:
+                sidecar.unlink()
+            except OSError as exc:
+                errors.append(f"Cannot delete {sidecar.name}: {exc}")
+        if self.db is not None and item["forms"]:
+            try:
+                drop_import_tables(self.db, item["forms"])
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            self._show_multiline_popup(stdscr, "Delete Imported Excel",
+                                       "\n".join(errors))
+        else:
+            self._show_multiline_popup(
+                stdscr, "Delete Imported Excel",
+                f"Removed {stem} ({forms}).\n\n"
+                "It will leave the app menu on the next launch.")
 
     def _console_startup_recovery(self) -> bool:
         """Offer a plain-console company switch flow before curses starts.
@@ -378,6 +649,10 @@ class ScriptRunner:
 
     def _load_active_company(self):
         """Set company_name from the active company profile."""
+        # When running with --db override, use the DSL app name as company name
+        if self._db_override:
+            self.company_name = self.app.get("meta", {}).get("name", "")
+            return
         companies = self._load_companies()
         if not companies:
             # No companies file yet — use default db name as company
@@ -5931,6 +6206,27 @@ class ScriptRunner:
                         continue
                 continue
 
+            elif action == "__crud_form__":
+                # Open the blank Form and Edit tab without growing navigation
+                # history; both generated layouts are one logical screen.
+                peer = (layout_def.get("crud_tabs") or {}).get("peer")
+                if peer in self.app["layouts"]:
+                    self.edit_context = None
+                    current_layout = peer
+                continue
+
+            elif action == "__crud_list__":
+                # Return to the listing.  If this form was opened by Enter/F3,
+                # consume the matching history entry so Esc goes to the menu.
+                peer = (layout_def.get("crud_tabs") or {}).get("peer")
+                if peer in self.app["layouts"]:
+                    self.edit_context = None
+                    if history and history[-1] == peer:
+                        current_layout = history.pop()
+                    else:
+                        current_layout = peer
+                continue
+
             # ── Handle regular actions ──
             elif action in self.app["actions"]:
                 act_def = self.app["actions"][action]
@@ -5995,6 +6291,12 @@ class ScriptRunner:
                 elif act_def["type"] == "settings":
                     self._open_business_settings(stdscr)
                     continue
+                elif act_def["type"] == "excel_import":
+                    self._open_excel_import(stdscr)
+                    continue
+                elif act_def["type"] == "delete_import_excel":
+                    self._delete_imported_excel(stdscr)
+                    continue
                 elif act_def["type"] == "b2b_inbox":
                     self._open_b2b_inbox(stdscr)
                     continue
@@ -6005,7 +6307,14 @@ class ScriptRunner:
                     break
             elif action == "":
                 self.edit_context = None
-                if history:
+                crud_tabs = layout_def.get("crud_tabs") or {}
+                peer = crud_tabs.get("peer")
+                if crud_tabs.get("active") == "form" and peer in self.app["layouts"]:
+                    if history and history[-1] == peer:
+                        current_layout = history.pop()
+                    else:
+                        current_layout = peer
+                elif history:
                     current_layout = history.pop()
                 else:
                     break

@@ -305,6 +305,9 @@ class LayoutRenderer:
                     widget = Checkbox(y, wx, fid, value=False)
                 elif ftype in ("INT", "FLOAT"):
                     decimals = 0 if ftype == "INT" else 2
+                    subtype = field.get("subtype", "")
+                    if subtype == "percentage":
+                        decimals = 4  # store as decimal (0.08 = 8%)
                     default = field.get("default", 0)
                     if self._default_resolver:
                         default = self._default_resolver(default)
@@ -313,6 +316,8 @@ class LayoutRenderer:
                     except (ValueError, TypeError):
                         default = 0
                     widget = NumericInput(y, wx, width, value=default, decimals=decimals)
+                    if subtype:
+                        widget._subtype = subtype
                 elif ftype == "DATE" or ftype == "DATETIME":
                     widget = DateInput(y, wx, 12)
                 elif ftype == "ENUM" and "enum_list" in field:
@@ -379,7 +384,13 @@ class LayoutRenderer:
                     if lookup_grid_id in self.app_grids:
                         all_cols = self.app_grids[lookup_grid_id].get("columns")
                         if all_cols:
+                            include = field.get("lookup_include")
+                            exclude = field.get("lookup_exclude")
                             lcols = [c for c in all_cols if not c.get("hidden")]
+                            if include:
+                                lcols = [c for c in lcols if c["id"] in include]
+                            if exclude:
+                                lcols = [c for c in lcols if c["id"] not in exclude]
                     lookup_w = min(width, avail_w)
                     widget = LookupField(y, wx, lookup_w, ldata,
                                          display_field=df, value_field=vf,
@@ -399,6 +410,9 @@ class LayoutRenderer:
                                                 value=str(default_val))
                     else:
                         widget = TextInput(y, wx, width, value=str(default_val))
+                    subtype = field.get("subtype", "")
+                    if subtype:
+                        widget._subtype = subtype
 
                 # Apply readonly flag to any widget
                 if self._is_readonly_for_level(field, self.user_level):
@@ -408,6 +422,13 @@ class LayoutRenderer:
                 # Keep the DSL field ID for storage, but display a readable
                 # label in the form without internal underscore separators.
                 widget._label = fid.replace("_", " ").title()
+                subtype = field.get("subtype", "")
+                if subtype == "currency":
+                    widget._label = widget._label + " ($)"
+                elif subtype == "percentage":
+                    widget._label = widget._label + " (%)"
+                elif subtype == "email":
+                    widget._label = widget._label + " (@)"
                 widget._label_x = lx
                 self.widgets.append(widget)
 
@@ -419,6 +440,7 @@ class LayoutRenderer:
                     row_offset += 1
                 row_offset += extra_rows
         self._wire_item_master_auto_conversion()
+        self._wire_formula_fields()
 
     def _widget_map(self) -> Dict[str, BaseWidget]:
         return {
@@ -426,6 +448,65 @@ class LayoutRenderer:
             for widget in self.widgets
             if getattr(widget, '_field_id', '')
         }
+
+    def _wire_formula_fields(self):
+        """Mark formula fields readonly and set up re-evaluation on sibling changes."""
+        form_fields = {}
+        for ref_id, placement in self.layout_def.get("fields", {}).items():
+            form_def = self.form_defs.get(ref_id)
+            if not form_def or not isinstance(form_def, list):
+                continue
+            for f in form_def:
+                if f.get("formula"):
+                    form_fields[f["id"]] = f["formula"]
+
+        if not form_fields:
+            return
+
+        widget_map = self._widget_map()
+        formula_widgets = {fid: widget_map[fid] for fid in form_fields if fid in widget_map}
+
+        # Mark formula fields readonly
+        for w in formula_widgets.values():
+            w._readonly = True
+
+        # Store formulas for re-evaluation
+        self._field_formulas = form_fields
+
+        # Wire on_change on non-formula fields to trigger re-evaluation
+        non_formula = {fid: w for fid, w in widget_map.items() if fid not in form_fields}
+
+        def make_reeval(formula_wids, fmls, wmap):
+            def reeval(val):
+                # Build current header values from all widgets
+                header = {fid: w.value for fid, w in wmap.items()}
+                for fid, expr in fmls.items():
+                    try:
+                        ctx = {'__builtins__': {}, 'abs': abs, 'min': min, 'max': max, 'round': round}
+                        for k, v in header.items():
+                            try:
+                                ctx[k] = float(v) if v not in (None, '') else 0.0
+                            except (ValueError, TypeError):
+                                ctx[k] = 0.0
+                        result = eval(expr, ctx)  # noqa: S307
+                        if fid in formula_wids:
+                            formula_wids[fid].load(result)
+                    except Exception:
+                        pass
+            return reeval
+
+        reeval_fn = make_reeval(formula_widgets, form_fields, widget_map)
+        for w in non_formula.values():
+            old_on_change = w.on_change
+
+            def make_chain(old, new):
+                def chained(val):
+                    if old:
+                        old(val)
+                    new(val)
+                return chained
+
+            w.on_change = make_chain(old_on_change, reeval_fn)
 
     def _load_widget_value(self, widget: Optional[BaseWidget], value: Any):
         if not widget:
@@ -1682,6 +1763,26 @@ class LayoutRenderer:
                                        curses.A_BOLD | border_attr)
                 except curses.error:
                     pass
+        self._draw_crud_tabs(frame_y)
+
+    def _draw_crud_tabs(self, frame_y: int):
+        """Draw the top-level List/Form selector for a TABBED CRUD form."""
+        tabs = self.layout_def.get("crud_tabs")
+        if not tabs:
+            return
+        labels = tabs.get("labels") or ["List", "Form and Edit"]
+        active = 0 if tabs.get("active") == "list" else 1
+        x = self.layout_def.get("position", {}).get("x", 0) + 2
+        y = frame_y + 1
+        for index, label in enumerate(labels[:2]):
+            text = f" {label} "
+            attr = curses.A_BOLD | curses.A_REVERSE \
+                if index == active else curses.A_DIM
+            try:
+                self.stdscr.addstr(y, x, text, attr)
+            except curses.error:
+                pass
+            x += len(text) + 1
 
     def _draw_widgets(self):
         label_attr = curses.color_pair(CLR_FORM_LABEL)
@@ -1800,9 +1901,13 @@ class LayoutRenderer:
             rowid = ""
             if self.edit_context and self.edit_context.get("rowid"):
                 rowid = f" #{self.edit_context['rowid']}"
-            self.status_line.set_info(f"Editing{rowid}" if rowid else "")
+            info = f"Editing{rowid}" if rowid else ""
+            if self.layout_def.get("crud_tabs"):
+                info = (info + "  " if info else "") + "PgUp: List"
+            self.status_line.set_info(info)
         else:
-            self.status_line.set_info("")
+            info = "PgUp: List" if self.layout_def.get("crud_tabs") else ""
+            self.status_line.set_info(info)
 
         self.status_line.draw()
 
@@ -2230,8 +2335,14 @@ class LayoutRenderer:
                         self._save_column_config(ag)
                 continue
             elif key == curses.KEY_F6:  # F6 cycle header/detail/UDF focus
+                if self.layout_def.get("crud_tabs") and not self.tabs_def:
+                    self._hide_cursor()
+                    return "__crud_list__"
                 focus_idx = cycle_focus_zone()
                 continue
+            elif key == curses.KEY_PPAGE and self.layout_def.get("crud_tabs"):
+                self._hide_cursor()
+                return "__crud_list__"
             elif key == curses.KEY_F7 and self.udf_panel and not on_tabs:  # F7 UDF Schema
                 self.udf_panel.schema_editor()
                 continue
@@ -2400,6 +2511,8 @@ class LayoutRenderer:
                     max_y, max_x = self.stdscr.getmaxyx()
                     row_count = len(grid.data)
                     info = f"Rows: {row_count}"
+                    if self.layout_def.get("crud_tabs"):
+                        info += "  [Tab: Form and Edit]  [PgUp/PgDn: Page]"
                     # Show current LISTVIEW label if defined
                     grid_id = getattr(grid, '_grid_id', '')
                     gdef = self.grid_defs.get(grid_id, {})
@@ -2440,6 +2553,10 @@ class LayoutRenderer:
                         return "__edit__"
                 elif key == curses.KEY_F3:
                     return "__new__"
+                elif key == 9 and self.layout_def.get("crud_tabs"):
+                    # Tab switches to the Form and Edit tab. PgUp/PgDn stay
+                    # with the grid so Page Up/Down page through the list.
+                    return "__crud_form__"
                 elif key == curses.KEY_F8:  # F8 — column config
                     grid._open_column_config()
                     self._save_column_config(grid)

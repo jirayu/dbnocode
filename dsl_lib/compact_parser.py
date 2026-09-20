@@ -172,21 +172,21 @@ class CompactDSLParser:
             return
 
         if main_layout:
-            # Append a "System" section to existing center_menu
-            center = main_layout.get("center_menu")
-            if center is None:
-                center = []
-                main_layout["center_menu"] = center
-            center.append({"label": "System", "section": True})
-            for item in missing:
-                center.append(dict(item))
-
-            # Also append to top_menus if pulldown style
             top_menus = main_layout.get("top_menus") or self.app.get("top_menus")
             if top_menus:
+                # Pulldown style — append System group to top bar only
                 sys_pd = {"label": "System", "items": [dict(i) for i in missing]}
                 top_menus.append(sys_pd)
                 self.app["top_menus"] = top_menus
+            else:
+                # Center/mainmenu style — append System section to center_menu
+                center = main_layout.get("center_menu")
+                if center is None:
+                    center = []
+                    main_layout["center_menu"] = center
+                center.append({"label": "System", "section": True})
+                for item in missing:
+                    center.append(dict(item))
         else:
             # No menu at all — create default system menu
             self.app["actions"]["exit_app"] = {"type": "exit"}
@@ -596,11 +596,29 @@ class CompactDSLParser:
             # Remove opts from flags_str for remaining parsing
             flags_str = flags_str[:opts_m.start()] + flags_str[opts_m.end():]
 
-        # Handle formula: specially (may contain spaces)
-        formula_m = re.search(r'formula:(\S+)', flags_str)
+        # Handle formula: specially (may contain spaces) — must be last flag
+        formula_m = re.search(r'\bformula:(.+)', flags_str, re.I)
         if formula_m:
-            field["formula"] = formula_m.group(1)
-            flags_str = flags_str[:formula_m.start()] + flags_str[formula_m.end():]
+            field["formula"] = formula_m.group(1).strip()
+            flags_str = flags_str[:formula_m.start()]
+
+        # Extract lookup with optional INCLUDE/EXCLUDE/CASCADE modifiers
+        lookup_full_m = re.search(
+            r'\blookup:(\w+)'
+            r'(?:\s+INCLUDE\s+([\w,]+))?'
+            r'(?:\s+EXCLUDE\s+([\w,]+))?'
+            r'(?:\s+CASCADE\s+([\w\->]+))?',
+            flags_str, re.I
+        )
+        if lookup_full_m:
+            field["lookup"] = lookup_full_m.group(1)
+            if lookup_full_m.group(2):
+                field["lookup_include"] = [f.strip() for f in lookup_full_m.group(2).split(",") if f.strip()]
+            if lookup_full_m.group(3):
+                field["lookup_exclude"] = [f.strip() for f in lookup_full_m.group(3).split(",") if f.strip()]
+            if lookup_full_m.group(4):
+                field["lookup_cascade"] = lookup_full_m.group(4)
+            flags_str = flags_str[:lookup_full_m.start()] + flags_str[lookup_full_m.end():]
 
         tokens = flags_str.split()
         for tok in tokens:
@@ -647,7 +665,12 @@ class CompactDSLParser:
             elif tok_lower.startswith("default:"):
                 field["default"] = tok[8:]
             elif tok_lower.startswith("lookup:"):
-                field["lookup"] = tok[7:]
+                pass  # handled by lookup_full_m above
+            elif tok_lower in ("email", "phone", "uuid", "json", "color", "time", "timestamp"):
+                field["subtype"] = tok_lower
+            elif tok_lower in ("currency", "percentage"):
+                field["subtype"] = tok_lower
+                field["type"] = "FLOAT"
             elif tok_lower.startswith("fill:"):
                 fill_val = tok[5:]
                 if "=>" in fill_val:
@@ -786,11 +809,11 @@ class CompactDSLParser:
     def _apply_col_flags(self, col: dict, flags_str: str):
         """Parse column flag tokens."""
         unknown = []
-        # Handle formula:
-        formula_m = re.search(r'formula:(\S+)', flags_str)
+        # Handle formula: — must be last flag (captures everything after)
+        formula_m = re.search(r'\bformula:(.+)', flags_str, re.I)
         if formula_m:
-            col["formula"] = formula_m.group(1)
-            flags_str = flags_str[:formula_m.start()] + flags_str[formula_m.end():]
+            col["formula"] = formula_m.group(1).strip()
+            flags_str = flags_str[:formula_m.start()]
 
         # Handle opts:
         opts_m = re.search(r'opts:(.+?)(?:\s+(?:req|num|date|ro|hidden|upper|prefix|span|rows|default|lookup|fill|formula|key|copydetail|filter|readonly_below)\b|$)', flags_str)
@@ -798,10 +821,30 @@ class CompactDSLParser:
             col["enum_list"] = [v.strip() for v in opts_m.group(1).split(",")]
             flags_str = flags_str[:opts_m.start()] + flags_str[opts_m.end():]
 
+        # Extract lookup with optional INCLUDE/EXCLUDE/CASCADE modifiers
+        lookup_full_m = re.search(
+            r'\blookup:(\w+)'
+            r'(?:\s+INCLUDE\s+([\w,]+))?'
+            r'(?:\s+EXCLUDE\s+([\w,]+))?'
+            r'(?:\s+CASCADE\s+([\w\->]+))?',
+            flags_str, re.I
+        )
+        if lookup_full_m:
+            col["lookup"] = lookup_full_m.group(1)
+            if lookup_full_m.group(2):
+                col["lookup_include"] = [f.strip() for f in lookup_full_m.group(2).split(",") if f.strip()]
+            if lookup_full_m.group(3):
+                col["lookup_exclude"] = [f.strip() for f in lookup_full_m.group(3).split(",") if f.strip()]
+            if lookup_full_m.group(4):
+                col["lookup_cascade"] = lookup_full_m.group(4)
+            flags_str = flags_str[:lookup_full_m.start()] + flags_str[lookup_full_m.end():]
+
         tokens = flags_str.split()
         for tok in tokens:
             tok_lower = tok.lower()
-            if tok_lower == "num":
+            if tok_lower == "req":
+                col["required"] = True
+            elif tok_lower == "num":
                 col["type"] = "FLOAT"
             elif tok_lower == "date":
                 col["type"] = "DATE"
@@ -817,7 +860,12 @@ class CompactDSLParser:
             elif tok_lower == "upper":
                 col["upper"] = True
             elif tok_lower.startswith("lookup:"):
-                col["lookup"] = tok[7:]
+                pass  # handled by lookup_full_m above
+            elif tok_lower in ("email", "phone", "uuid", "json", "color", "time", "timestamp"):
+                col["subtype"] = tok_lower
+            elif tok_lower in ("currency", "percentage"):
+                col["subtype"] = tok_lower
+                col["type"] = "FLOAT"
             elif tok_lower.startswith("fill:"):
                 fill_val = tok[5:]
                 if "=>" in fill_val:
@@ -1089,7 +1137,7 @@ class CompactDSLParser:
                 pm = re.match(rf'^(?:PULLDOWN|GROUP)\s+{QUOTED}', line, re.I)
                 if pm:
                     pd = {"label": pm.group(1), "items": []}
-                    while self._peek() and self._peek().upper().strip() != "END":
+                    while self._peek() and not re.match(r'^END(\s+GROUP)?$', self._peek().strip(), re.I):
                         pl = self._next().strip()
                         if pl == "---" or pl.upper() == "SEPARATOR":
                             pd["items"].append({"separator": True})
@@ -1097,7 +1145,7 @@ class CompactDSLParser:
                             item = self._parse_menu_item(pl)
                             if item:
                                 pd["items"].append(item)
-                    self._next()  # consume END
+                    self._next()  # consume END / END GROUP
                     top_menus.append(pd)
 
             elif up.startswith("CENTER"):
@@ -1312,11 +1360,11 @@ class CompactDSLParser:
                 pass
         if len(parts) > 3:
             flags_str = parts[3]
-            # Handle formula: specially
-            formula_m = re.search(r'formula:(\S+)', flags_str)
+            # Handle formula: specially — captures everything after formula:
+            formula_m = re.search(r'\bformula:(.+)', flags_str, re.I)
             if formula_m:
-                col["formula"] = formula_m.group(1)
-                flags_str = flags_str[:formula_m.start()] + flags_str[formula_m.end():]
+                col["formula"] = formula_m.group(1).strip()
+                flags_str = flags_str[:formula_m.start()]
             tokens = flags_str.split()
             for tok in tokens:
                 tl = tok.lower()

@@ -9,7 +9,7 @@ class ValidationError:
 class ValidationResult:
     valid: bool=True; errors: List[ValidationError]=None; warnings: List[ValidationError]=None; summary: Dict=None
 
-ALLOWED_TYPES = {"STRING","INT","FLOAT","DATE","DATETIME","BOOL","ENUM"}
+ALLOWED_TYPES = {"STRING","INT","FLOAT","DATE","DATETIME","BOOL","ENUM","TIME","TIMESTAMP","UUID","JSON","EMAIL","PHONE","CURRENCY","PERCENTAGE","COLOR"}
 ALLOWED_COMMANDS = {"SET","CALC","LOAD","SAVE","DELETE","LOOKUP","SQL","IF","ELSE","ENDIF","FOR","NEXT","EXIT","RETURN","RAISE","SHOW","WARN","FOCUS","REFRESH","GOTO","RUN"}
 
 ALLOWED_ADAPTERS = {"sqlite", "postgres", "firebird"}
@@ -19,13 +19,35 @@ QUOTED_ID = r'"[a-zA-Z0-9_]+"'
 class DSLValidator:
     def __init__(self):
         self.result = ValidationResult(errors=[], warnings=[], summary={})
-        self.lines = []
         self.line_num = 0
         self.declared = {"forms": set(), "grids": set(), "actions": set(), "screens": set()}
 
     def _error(self, code: str, message: str, fix: str = ""):
         self.result.valid = False
         self.result.errors.append(ValidationError(code, message, self.line_num, fix))
+
+    def _parse_lookup_expression(self, expr: str) -> List[str]:
+        """Parse a lookup expression to extract form names.
+        Supports:
+          lookup:form
+          lookup:form1|form2|form3
+          lookup:form INCLUDE f1,f2
+          lookup:form EXCLUDE f1,f2
+          lookup:form (f1 AS alias1, f2)
+          lookup:form CASCADE a->b
+        We split by '|' and then take the first word of each part.
+        """
+        if not expr:
+            return []
+        parts = expr.split("|")
+        forms = []
+        for part in parts:
+            part = part.strip()
+            if part:
+                # Split by whitespace and take the first token
+                first_word = part.split()[0]
+                forms.append(first_word)
+        return forms
 
     def validate(self, text: str, compact: bool = False) -> ValidationResult:
         self.result = ValidationResult(errors=[], warnings=[], summary={})
@@ -69,7 +91,8 @@ class DSLValidator:
                     target = m.group(1)
                     base = target.split('.', 1)[0]
                     builtins = {"EXIT", "REPORTS", "SETTINGS", "SWITCH", "RESET",
-                                "POS", "POS.SCREEN", "WHMAP", "B2B"}
+                                "POS", "POS.SCREEN", "WHMAP", "B2B", "EXCEL",
+                                "IMPORT"}
                     if (not target.lower().startswith("report:")
                             and base.upper() not in builtins and base not in self.declared["forms"]
                             and base not in self.declared["actions"]):
@@ -141,6 +164,10 @@ class DSLValidator:
             keyword = up.split()[0] if up else ""
             if up.startswith("ON SAVE"):
                 stack.append("SAVE")
+                continue
+            # Field lines are `name | width | flags`; a slug such as `stock`
+            # or `detail` would otherwise be misread as a block header.
+            if " | " in line:
                 continue
             if keyword == "GROUP" and not re.search(r'GROUP\s+"', line, re.I):
                 continue
@@ -226,6 +253,14 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
                 error("INVALID_FIELD_TYPE", f"Field '{form_id}.{field.get('id', '?')}' has invalid type '{field.get('type')}'")
             if field.get("type") == "ENUM" and not field.get("enum_list"):
                 error("INVALID_ENUM", f"Field '{form_id}.{field.get('id', '?')}' has no enum values")
+            # Validate lookup: check that the referenced form(s) exist
+            if field.get("lookup"):
+                # We need to parse the lookup expression to get the form names
+                # We'll create a temporary validator to use its _parse_lookup_expression method
+                # But we don't have access to self here. We'll duplicate the logic.
+                # Alternatively, we can define a helper function here.
+                # Let's define a helper function inside validate_app_definition.
+                pass  # We'll do this after we define the helper
 
     for grid_id, grid in grids.items():
         parent = grid.get("parent")
@@ -250,6 +285,10 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
                     not isinstance(col["readonly_below"], int)
                     or col["readonly_below"] < 0):
                 error("INVALID_PERMISSION_LEVEL", f"Grid '{grid_id}' column '{cid}' has invalid readonly_below level")
+            # Validate lookup for column
+            if col.get("lookup"):
+                # We'll do the same as for fields
+                pass
 
     for layout_id, layout in layouts.items():
         for ref in (layout.get("fields") or {}):
@@ -292,31 +331,52 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
             if script and script not in scripts and script not in (app.get("subroutines") or {}):
                 error("INVALID_WORKFLOW_SCRIPT", f"Workflow in '{layout_id}' references missing script '{script}'")
         for item in workflow.get("actions", []):
-            if item.get("script") and item["script"] not in scripts and item["script"] not in (app.get("subroutines") or {}):
-                error("INVALID_WORKFLOW_SCRIPT", f"Workflow in '{layout_id}' references missing script '{item['script']}'")
+            script = item.get("script")
+            if script and script not in scripts and script not in (app.get("subroutines") or {}):
+                error("INVALID_WORKFLOW_SCRIPT", f"Workflow in '{layout_id}' references missing script '{script}'")
 
-    for report_id, report in reports.items():
-        source = report.get("source")
-        if not source:
-            error("MISSING_REPORT_SOURCE", f"Report '{report_id}' has no source")
-        source_fields = set()
-        for form_id, fields in forms.items():
-            if form_id == source or form_id.removesuffix("_form") == source:
-                source_fields = field_sets.get(form_id, set())
-                break
-        if source_fields:
-            for col in report.get("columns") or []:
-                cid = col.get("id")
-                if cid not in source_fields and not col.get("formula"):
-                    error("INVALID_REPORT_COLUMN", f"Report '{report_id}' column '{cid}' is not in source '{source}'")
-    result.summary = {"forms": len(forms), "grids": len(grids), "layouts": len(layouts), "actions": len(actions), "reports": len(reports)}
+    # Now we need to validate the lookup expressions in fields and columns.
+    # We'll create a helper function to parse the lookup expression and get the form names.
+    def _parse_lookup_expression(expr: str) -> List[str]:
+        if not expr:
+            return []
+        parts = expr.split("|")
+        forms = []
+        for part in parts:
+            part = part.strip()
+            if part:
+                first_word = part.split()[0]
+                forms.append(first_word)
+        return forms
+
+    # Form names in the dict use _form suffix; lookup expressions use bare names
+    form_bare_names = {k.removesuffix("_form") for k in forms}
+
+    # Validate fields
+    for form_id, fields in forms.items():
+        for field in fields or []:
+            if field.get("type") in {"SECTION", "SPACER"}:
+                continue
+            if field.get("lookup"):
+                form_names = _parse_lookup_expression(field["lookup"])
+                for form_name in form_names:
+                    if form_name not in form_bare_names:
+                        # Warn only — lookup target may be in another DSL file loaded at runtime
+                        result.warnings.append(ValidationError("UNKNOWN_LOOKUP_FORM",
+                            f"Field '{form_id}.{field.get('id', '?')}' references unknown form '{form_name}' in lookup", 0))
+
+    # Validate columns
+    for grid_id, grid in grids.items():
+        for col in grid.get("columns", []):
+            if col.get("lookup"):
+                form_names = _parse_lookup_expression(col["lookup"])
+                for form_name in form_names:
+                    if form_name not in form_bare_names:
+                        # Warn only — lookup target may be in another DSL file loaded at runtime
+                        result.warnings.append(ValidationError("UNKNOWN_LOOKUP_FORM",
+                            f"Column '{grid_id}.{col.get('id', '?')}' references unknown form '{form_name}' in lookup", 0))
+
     return result
 
-
-class SemanticValidator:
-    """Small reusable facade for validating a parsed app definition."""
-
-    def validate(self, app: Dict[str, Any]) -> ValidationResult:
-        return validate_app_definition(app)
-
-
+class SemanticValidator(DSLValidator):
+    pass

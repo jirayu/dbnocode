@@ -96,6 +96,34 @@ def _load_dsl_with_includes(script_path: str, stack=None) -> str:
 
 def main():
     args = sys.argv[1:]
+    if "--import-excel" in args:
+        from dsl_lib.excel_importer import import_workbook
+
+        def option_value(name):
+            if name not in args:
+                return None
+            index = args.index(name)
+            if index + 1 >= len(args) or args[index + 1].startswith("--"):
+                raise ValueError(f"{name} requires a value")
+            return args[index + 1]
+
+        try:
+            workbook = option_value("--import-excel")
+            result = import_workbook(
+                workbook,
+                script_path=option_value("--output"),
+                database_path=option_value("--database"),
+                force="--force" in args,
+            )
+        except Exception as exc:
+            print(f"Excel import failed: {exc}")
+            sys.exit(1)
+        print(
+            f"Imported {result.forms} form(s), {result.rows} row(s)\n"
+            f"DSL: {result.script_path}\nDatabase: {result.database_path}\n"
+            f"Run: python main.py \"{result.script_path}\""
+        )
+        return
     script_path = _resolve_script_path(_select_script_path(args))
     validate_only = "--validate-only" in args
 
@@ -136,6 +164,17 @@ def main():
             print(f"Parse failed: {exc}")
             sys.exit(1)
 
+    # Excel imports created from the main menu are registered beside the host
+    # script. Merge their generated forms before semantic validation so they
+    # behave exactly like forms declared in the main DSL on every launch.
+    app_def["_script_path"] = os.path.abspath(script_path)
+    try:
+        from dsl_lib.excel_importer import load_registered_imports
+        for warning in load_registered_imports(app_def, script_path):
+            print(f"Excel import warning: {warning}")
+    except ImportError:
+        pass
+
     semantic = validate_app_definition(app_def)
     if not semantic.valid:
         print("Semantic validation failed:")
@@ -149,7 +188,14 @@ def main():
     if validate_only:
         sys.exit(0)
 
-    runner = ScriptRunner(app_def)
+    # --db path overrides company selection (used by showcase / standalone scripts)
+    db_override = None
+    if "--db" in args:
+        idx = args.index("--db")
+        if idx + 1 < len(args):
+            db_override = args[idx + 1]
+
+    runner = ScriptRunner(app_def, db_override=db_override)
     runner.run()
 
 
