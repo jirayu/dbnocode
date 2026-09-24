@@ -63,7 +63,8 @@ the `.dsl` file for you.
 you describe, the AI generates a validated, runnable script. Edit the text file
 line by line any time to tweak it; every screen you see is defined in plain text.
 
-1. Give your AI assistant these three files:
+1. Give your AI assistant these files:
+   - **`docs/ai_authoring.md`** — exact syntax, block terminators, common errors to avoid (**start here**)
    - `docs/dsl_tutorial.md` — how to build forms, details, stock, reports, menus
    - `docs/canonical_dsl.md` — the canonical DSL reference
    - `docs/grammar.ebnf` — the formal grammar
@@ -72,7 +73,7 @@ line by line any time to tweak it; every screen you see is defined in plain text
 
    ```text
    You are authoring a dbnocode DSL application.
-   Read docs/dsl_tutorial.md, docs/canonical_dsl.md and docs/grammar.ebnf.
+   Read docs/ai_authoring.md FIRST, then docs/dsl_tutorial.md and docs/canonical_dsl.md.
 
    Build an application for: {describe your app — e.g. an auto repair shop
    with work orders, customer vehicles, parts stock and a job pricing report}
@@ -168,6 +169,9 @@ DATASOURCE "myapp_db" ADAPTER "firebird"    # Firebird
 
 ## Learning & reference
 
+- **[`docs/ai_authoring.md`](docs/ai_authoring.md)** — AI authoring cheat sheet:
+  exact block terminators, complete flag list, common errors, working example.
+  **Read this before giving the DSL to any AI tool.**
 - **[`docs/dsl_tutorial.md`](docs/dsl_tutorial.md)** — step-by-step tutorial:
   forms, fields, details, scripts, stock, menus, reports, users.
 - **[`docs/canonical_dsl.md`](docs/canonical_dsl.md)** — the canonical DSL reference.

@@ -1449,7 +1449,7 @@ class Grid:
             if formatted == "0":
                 return ""
             return formatted
-        s = str(val)
+        s = str(val).replace("\r", " ").replace("\n", " ").replace("\t", " ")
         if len(s) > col.width:
             return s[:col.width - 1] + "\u2026"
         return s
@@ -1459,11 +1459,11 @@ class Grid:
         if col.lookup and self.lookup_handler:
             display = self.lookup_handler(col.lookup, val)
             if display is not None:
-                s = str(display)
+                s = str(display).replace("\r", " ").replace("\n", " ").replace("\t", " ")
                 if len(s) > col.width:
                     return s[:col.width - 1] + "\u2026"
                 return s
-        return str(val) if val is not None else ""
+        return str(val).replace("\r", " ").replace("\n", " ").replace("\t", " ") if val is not None else ""
 
     def _cell_display(self, col, row_data):
         """Format a cell for drawing.
