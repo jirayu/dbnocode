@@ -6,6 +6,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dsl_lib import (DSLValidator, DSLParser, CompactDSLParser, ScriptRunner,
                      validate_app_definition)
+from dsl_lib._text import strip_comments
 
 _INCLUDE_RE = re.compile(r'^\s*INCLUDE\s+(?:"([^"]+)"|([^\s]+))\s*$', re.I)
 _DEFAULT_SCRIPT = os.path.join("scripts", "main.dsl")
@@ -18,7 +19,7 @@ def _is_compact(text: str) -> bool:
     Verbose uses quoted FORM names:    FORM "item_form"
     """
     for line in text.splitlines():
-        stripped = re.sub(r'//.*', '', line).strip()
+        stripped = strip_comments(line).strip()
         if re.match(r'^FORM\s+\w', stripped, re.I):
             # Check if the name after FORM is quoted or not
             if re.match(r'^FORM\s+"', stripped, re.I):
@@ -47,8 +48,13 @@ def _select_script_path(args) -> str:
     return next((arg for arg in args if not arg.startswith("--")), _DEFAULT_SCRIPT)
 
 
-def _load_dsl_with_includes(script_path: str, stack=None) -> str:
-    """Load a DSL file and inline any top-level INCLUDE directives."""
+def _load_dsl_entries(script_path: str, stack=None):
+    """Load a DSL file as a list of (raw_line, source_path, source_lineno).
+
+    Top-level INCLUDE directives are inlined; every returned entry knows the
+    file and 1-based line it came from so parse diagnostics can pinpoint the
+    original location even after flattening.
+    """
     resolved_path = os.path.abspath(_resolve_script_path(script_path))
     include_stack = list(stack or [])
     if resolved_path in include_stack:
@@ -59,18 +65,19 @@ def _load_dsl_with_includes(script_path: str, stack=None) -> str:
     with open(resolved_path, encoding="utf-8") as fh:
         raw_lines = fh.readlines()
 
-    merged = []
+    entries = []
     base_dir = os.path.dirname(resolved_path)
 
-    for raw_line in raw_lines:
-        stripped = re.sub(r'//.*', '', raw_line).strip()
+    for line_no, raw_line in enumerate(raw_lines, 1):
+        stripped = strip_comments(raw_line).strip()
         match = _INCLUDE_RE.fullmatch(stripped)
         if not match:
-            merged.append(raw_line)
+            entries.append((raw_line, resolved_path, line_no))
             continue
 
         include_ref = (match.group(1) or match.group(2) or '').strip()
         if not include_ref:
+            entries.append((raw_line, resolved_path, line_no))
             continue
 
         include_pattern = include_ref
@@ -85,13 +92,31 @@ def _load_dsl_with_includes(script_path: str, stack=None) -> str:
             )
 
         for include_path in include_paths:
-            merged.append(f'// INCLUDE "{include_path}"\n')
-            merged.append(_load_dsl_with_includes(include_path, include_stack))
-            if not merged[-1].endswith("\n"):
-                merged.append("\n")
+            entries.append((f'// INCLUDE "{include_path}"\n', resolved_path, line_no))
+            entries.extend(_load_dsl_entries(include_path, include_stack))
+            if entries and not entries[-1][0].endswith("\n"):
+                entries.append(("\n", resolved_path, line_no))
 
     include_stack.pop()
-    return ''.join(merged)
+    return entries
+
+
+def _load_dsl_with_includes(script_path: str, stack=None) -> str:
+    """Load a DSL file and inline any top-level INCLUDE directives."""
+    entries = _load_dsl_entries(script_path, list(stack or []))
+    return "".join(line for line, _, _ in entries)
+
+
+def _format_origin(origins, lineno) -> str:
+    """Render a flattened line number as its original file:line location."""
+    if origins and isinstance(lineno, int) and 0 < lineno <= len(origins):
+        path, line_no = origins[lineno - 1]
+        try:
+            shown = os.path.relpath(path)
+        except ValueError:
+            shown = path
+        return f"{shown}:{line_no}"
+    return f"line {lineno}"
 
 
 def main():
@@ -127,7 +152,16 @@ def main():
     script_path = _resolve_script_path(_select_script_path(args))
     validate_only = "--validate-only" in args
 
-    text = _load_dsl_with_includes(script_path)
+    entries = _load_dsl_entries(script_path)
+    text = "".join(line for line, _, _ in entries)
+    origins = [(path, line_no) for _, path, line_no in entries]
+
+    def show_parse_error(stage, exc):
+        lineno = getattr(exc, "line_no", None)
+        if lineno:
+            print(f"{stage}: {_format_origin(origins, lineno)}: {exc}")
+        else:
+            print(f"{stage}: {exc}")
 
     compact = _is_compact(text)
 
@@ -151,7 +185,7 @@ def main():
         try:
             app_def = parser.parse()
         except SyntaxError as exc:
-            print(f"Parse failed: {exc}")
+            show_parse_error("Parse failed", exc)
             sys.exit(1)
         form_count = len(app_def.get("forms", {}))
         grid_count = len(app_def.get("grids", {}))
@@ -161,7 +195,7 @@ def main():
         try:
             app_def = parser.parse()
         except SyntaxError as exc:
-            print(f"Parse failed: {exc}")
+            show_parse_error("Parse failed", exc)
             sys.exit(1)
 
     # Excel imports created from the main menu are registered beside the host
@@ -184,6 +218,13 @@ def main():
                 print(f"    Fix: {err.fix}")
         sys.exit(1)
     print("Semantic validation passed")
+
+    if semantic.warnings:
+        print("Semantic warnings:")
+        for warn in semantic.warnings:
+            print(f"  [{warn.code}] {warn.message}")
+            if warn.fix:
+                print(f"    Fix: {warn.fix}")
 
     if validate_only:
         sys.exit(0)

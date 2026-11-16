@@ -509,7 +509,7 @@ FORM grn TITLE "Goods Receipt" COLS 2
       IF po_number
         UPDATE item SET on_order = item.on_order - _grn_qty WHERE _rowid = item._rowid
         FETCH po_rec FROM po WHERE po_number = po_number
-        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND _parent_rowid = po_rec._rowid
+        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND unit_cost = line.unit_cost AND _parent_rowid = po_rec._rowid
         UPDATE po_line SET received_qty = po_ln.received_qty + line.received_qty WHERE _rowid = po_ln._rowid
       END
       INSERT item_lot SET entry_date = grn_date, doc_no = grn_no, lot_no = line.lot_no, warehouse = warehouse, on_hand = _grn_qty, uom = item.uom, unit_cost = line.unit_cost, _parent_rowid = item._rowid
@@ -525,7 +525,7 @@ FORM grn TITLE "Goods Receipt" COLS 2
       IF po_number
         UPDATE item SET on_order = item.on_order + _grn_qty WHERE _rowid = item._rowid
         FETCH po_rec FROM po WHERE po_number = po_number
-        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND _parent_rowid = po_rec._rowid
+        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND unit_cost = line.unit_cost AND _parent_rowid = po_rec._rowid
         UPDATE po_line SET received_qty = po_ln.received_qty - line.received_qty WHERE _rowid = po_ln._rowid
       END
       DELETE item_lot WHERE doc_no = grn_no AND _parent_rowid = item._rowid
@@ -872,7 +872,7 @@ FORM delivery TITLE "Delivery Order" COLS 2
       FETCH so_rec FROM so WHERE so_number = so_number
       SET _all_shipped = 1
       FOREACH line IN lines
-        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND _parent_rowid = so_rec._rowid
+        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND unit_price = line.unit_price AND _parent_rowid = so_rec._rowid
         UPDATE so_line SET shipped_qty = so_ln.shipped_qty + line.ship_qty WHERE _rowid = so_ln._rowid
         FETCH so_ln FROM so_line WHERE _rowid = so_ln._rowid
         IF so_ln.shipped_qty < so_ln.order_qty
@@ -900,7 +900,7 @@ FORM delivery TITLE "Delivery Order" COLS 2
     IF so_number
       FETCH so_rec FROM so WHERE so_number = so_number
       FOREACH line IN lines
-        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND _parent_rowid = so_rec._rowid
+        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND unit_price = line.unit_price AND _parent_rowid = so_rec._rowid
         UPDATE so_line SET shipped_qty = so_ln.shipped_qty - line.ship_qty WHERE _rowid = so_ln._rowid
       END
       UPDATE so SET status = "Confirmed" WHERE _rowid = so_rec._rowid

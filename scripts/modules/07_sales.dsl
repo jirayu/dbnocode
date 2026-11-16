@@ -119,7 +119,7 @@ FORM delivery TITLE "Delivery Order" COLS 2
       FETCH so_rec FROM so WHERE so_number = so_number
       SET _all_shipped = 1
       FOREACH line IN lines
-        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND _parent_rowid = so_rec._rowid
+        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND unit_price = line.unit_price AND _parent_rowid = so_rec._rowid
         UPDATE so_line SET shipped_qty = so_ln.shipped_qty + line.ship_qty WHERE _rowid = so_ln._rowid
         FETCH so_ln FROM so_line WHERE _rowid = so_ln._rowid
         IF so_ln.shipped_qty < so_ln.order_qty
@@ -141,7 +141,7 @@ FORM delivery TITLE "Delivery Order" COLS 2
     IF so_number
       FETCH so_rec FROM so WHERE so_number = so_number
       FOREACH line IN lines
-        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND _parent_rowid = so_rec._rowid
+        FETCH so_ln FROM so_line WHERE part_no = line.part_no AND unit_price = line.unit_price AND _parent_rowid = so_rec._rowid
         UPDATE so_line SET shipped_qty = so_ln.shipped_qty - line.ship_qty WHERE _rowid = so_ln._rowid
       END
       UPDATE so SET status = "Confirmed" WHERE _rowid = so_rec._rowid

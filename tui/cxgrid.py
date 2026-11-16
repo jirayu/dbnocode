@@ -4,6 +4,19 @@ import os
 import time
 import re
 
+try:
+    from .thai_util import has_thai, strip_thai
+except ImportError:  # direct-script execution
+    from thai_util import has_thai, strip_thai
+
+# ── Windows modified-key keycodes ─────────────────────────────────────
+# windows-curses (PDCursesMod, Windows console) reports Ctrl+Insert and
+# Ctrl+Delete as extended keycodes with no curses.py constant. Values
+# probed live on the Windows console; other terminals fall back to the
+# plain KEY_IC / KEY_DC codes bound alongside them.
+KEY_CTL_INSERT = 477    # Ctrl+Insert
+KEY_CTL_DELETE = 527    # Ctrl+Delete
+
 # ── Custom dropdown options persistence ──────────────────────────────
 _CUSTOM_OPTS_FILE = "custom_options.json"
 _custom_opts_cache = None
@@ -908,6 +921,19 @@ class Grid:
 
     # ==================== DATA OPS ====================
 
+    def allow_editing_columns(self, names):
+        """Make detail columns editable even if the DSL marks them ``ro``.
+
+        Part name / description is user-entered wording and starts from an
+        item lookup, but the user must still be able to type over it.
+        """
+        wanted = {str(n) for n in (names or ())}
+        for c in self.columns:
+            if c.name in wanted and not c.formula:
+                c.editable = True
+                c.original_editable = True
+        self.row_select_mode = all(not c.editable for c in self.columns)
+
     def add_row(self, row_data):
         self.data.append(row_data)
         self.compute_row(row_data)
@@ -922,6 +948,39 @@ class Grid:
         if visible_cols:
             self.col = visible_cols[0]
         self.ensure_visible()
+
+    def insert_row_here(self):
+        """Insert a blank row before the current row (Insert / Ctrl+Insert)."""
+        if self.row_select_mode:
+            self.set_status("Read-only grid")
+            return False
+        new_row = {}
+        for c in self.columns:
+            new_row[c.name] = 0 if c.numeric else ""
+        if self._view_indices:
+            data_idx = self._data_index(self.row)
+        else:
+            data_idx = len(self.data)
+        data_idx = max(0, min(data_idx, len(self.data)))
+        self.data.insert(data_idx, new_row)
+        self.compute_row(new_row)
+
+        # Keep row selections/bookmarks attached to the same records.
+        self.selected_rows = {
+            i if i < data_idx else i + 1 for i in self.selected_rows
+        }
+        self.bookmarked_rows = {
+            i if i < data_idx else i + 1 for i in self.bookmarked_rows
+        }
+
+        self._rebuild_view()
+        if data_idx in self._view_indices:
+            self.row = self._view_indices.index(data_idx)
+        elif self._view_indices:
+            self.row = min(self.row, len(self._view_indices) - 1)
+        self.ensure_visible()
+        self.set_status("Row inserted")
+        return True
 
     def delete_current_row(self):
         if not self._view_indices:
@@ -1471,13 +1530,19 @@ class Grid:
         Lookup columns with a lookupfill companion show the stored KEY (picker
         left column). The companion column shows the NAME (picker right column).
         Single lookup columns without lookupfill still resolve to display text.
+
+        Thai characters are stripped for display (they break curses column
+        math — combining vowels/tone marks render crooked in a grid); the
+        English/ASCII part shows as-is. The real Thai value stays in the
+        data for the Alt-L popup and the printed PDF.
         """
-        val = self._field_value(col, row_data)
         if col.lookup and (col.lookup_fill or col.lookup_fill_map):
-            return self.format_value(col, val)
-        if col.lookup:
-            return self.decorate_lookup(col, val)
-        return self.format_value(col, val)
+            shown = self.format_value(col, self._field_value(col, row_data))
+        elif col.lookup:
+            shown = self.decorate_lookup(col, self._field_value(col, row_data))
+        else:
+            shown = self.format_value(col, self._field_value(col, row_data))
+        return strip_thai(shown)
 
     def compute_row(self, row):
         for col in self.columns:
@@ -1495,56 +1560,122 @@ class Grid:
 
     # ==================== EDITING ====================
 
+    @staticmethod
+    def _lookup_key_field(col, sample):
+        """Choose the field that identifies a lookup row (e.g. part_no)."""
+        if col.lookup_list_cols:
+            ids = [c["id"] for c in col.lookup_list_cols if c.get("id")]
+            for cid in ids:
+                if cid.endswith(("_code", "_no", "_id")):
+                    return cid
+            if ids:
+                return ids[0]
+        skip = {"rowid", "_parent_rowid"}
+        fields = [k for k in sample if k not in skip and not k.startswith("_")]
+        for try_key in ("code", "id"):
+            if try_key in sample:
+                return try_key
+        for name in fields:
+            if name.endswith(("_code", "_no", "_id")):
+                return name
+        return fields[0] if fields else "code"
+
+    @staticmethod
+    def _lookup_display_field(sample, key_field):
+        """Choose the human-readable field shown next to the key."""
+        skip = {"rowid", "_parent_rowid"}
+        for try_name in ("name", "description", "full_name", "title"):
+            if try_name in sample:
+                return try_name
+        for name in sample:
+            if name not in skip and name.endswith("_name"):
+                return name
+        fields = [k for k in sample if k not in skip and not k.startswith("_")]
+        for name in fields:
+            if name != key_field:
+                return name
+        return key_field
+
     def _open_lookup(self, initial_search=""):
-        """Open lookup picker for the current column via F4 or typing.
+        """Open the searchable lookup picker for the current column (F4 / typing).
 
-        Uses on_lookup_pick callback if set, otherwise falls back to
-        the built-in _show_lookup_picker dialog.
+        Uses the same SearchDialog popup as form-level LookupFields so detail
+        grids get a search box, arrow/PgUp/PgDn navigation, ENTER to pick and
+        ESC to cancel — including a multi-column list when the target form
+        declares a LIST.
 
-        on_lookup_pick signature:
-            fn(col, lookup_name, items, current_value) -> picked_key or None
-
-            col:            GridColumn object being edited
-            lookup_name:    str — the lookup identifier (e.g. "product", "warehouse")
-            items:          list of (key, display_text) tuples from lookup_handler
-            current_value:  str — current cell value for pre-selection
-
-        The callback should return the selected key (str) or None if cancelled.
+        Returns nothing; the picked value (and any copy/fill fields) are written
+        straight into the current row.
         """
         if not self._view_indices:
+            self.set_status("No rows yet — press F3 to add a line")
+            return
+        if not (0 <= self.col < len(self.columns)):
             return
         col = self.columns[self.col]
         if not col.lookup:
-            self.set_status("No lookup on this column")
+            self.set_status(f"Column '{col.label}' has no lookup")
             return
         if not self.lookup_handler:
+            self.set_status("Lookup data is not available")
             return
-        # Use multi-column picker if LIST columns are defined
-        if col.lookup_list_cols:
-            items = self.lookup_handler(col.lookup, None, list_all=True, full_record=True)
-        else:
-            items = self.lookup_handler(col.lookup, None, list_all=True)
-        if not items:
-            self.set_status("Lookup returned no items")
-            return
-
         row_data = self._view_row(self.row)
         if row_data is None:
+            self.set_status("No row selected")
             return
         current = str(self._field_value(col, row_data) or "")
 
-        # Use custom pick dialog if provided, otherwise built-in
-        if self.on_lookup_pick:
-            picked = self.on_lookup_pick(col, col.lookup, items, current)
-        else:
-            picked = self._show_lookup_picker(col, items, current, initial_search=initial_search)
+        rows = self.lookup_handler(col.lookup, None, list_all=True,
+                                   full_record=True)
+        if not rows:
+            self.set_status(f"No '{col.lookup}' records to choose from")
+            return
 
-        if picked is not None:
+        list_cols = col.lookup_list_cols or None
+        if isinstance(rows[0], dict):
+            key_field = self._lookup_key_field(col, rows[0])
+            display_field = self._lookup_display_field(rows[0], key_field)
+            items = [dict(r) for r in rows]
+        else:
+            key_field, display_field = "_key", "_desc"
+            items = [{"_key": str(k), "_desc": str(d)} for k, d in rows]
+            list_cols = None
+
+        picked_key = None
+        picked_display = None
+        opened = False
+        try:
+            from .widgets import SearchDialog
+            picked_row = SearchDialog.show(
+                self.stdscr, self.start_y, self.start_x, col.width,
+                items, display_field, key_field,
+                title=f" {col.lookup.replace('_', ' ').title()} Lookup ",
+                list_columns=list_cols,
+                current_value=current,
+                initial_search=initial_search,
+            )
+            opened = True
+        except curses.error:
+            picked_row = None
+
+        if opened:
+            if picked_row is None:
+                return  # cancelled with ESC
+            picked_key = str(picked_row.get(key_field, "") or "")
+            picked_display = picked_row.get(display_field)
+        else:
+            # Dialog could not be created (tiny terminal) — use the built-in
+            # picker so F4 still works.
+            picked = self._show_lookup_picker(col, rows, current,
+                                              initial_search=initial_search)
+            if picked is None:
+                return
             if isinstance(picked, tuple):
                 picked_key, picked_display = picked
             else:
                 picked_key, picked_display = picked, None
 
+        if picked_key:
             old_value = self._field_value(col, row_data)
             self._set_field_value(col, row_data, picked_key)
 
@@ -1565,8 +1696,10 @@ class Grid:
 
             self.compute_row(row_data)
             if self.on_cell_edit:
-                self.on_cell_edit(self._data_index(self.row), col.store_field, old_value, picked_key)
+                self.on_cell_edit(self._data_index(self.row), col.store_field,
+                                  old_value, picked_key)
             self.move_next_column()
+
 
     def start_edit(self, initial_key=None):
         if self.edit_mode:
@@ -1756,7 +1889,16 @@ class Grid:
             cursor_x = x + min(self.edit_pos, w - 1)
 
         self._safe_addstr(y, x, cell_text, edit_attr)
+        # Manual caret: paint the character under the insertion point
+        # inverted so typing stays visible even when the terminal cursor
+        # cannot be shown or the move() below fails (small terminals,
+        # terminals that hide the caret in reverse-video cells).
+        caret_idx = cursor_x - x
+        if 0 <= caret_idx < len(cell_text):
+            self._safe_addstr(y, cursor_x, cell_text[caret_idx],
+                              edit_attr | curses.A_REVERSE)
         try:
+            curses.curs_set(1)
             self.stdscr.move(y, cursor_x)
             self.stdscr.refresh()
         except curses.error:
@@ -2544,14 +2686,16 @@ class Grid:
     # ==================== NAVIGATION ====================
 
     def move_down(self):
-        """Move cursor down one row."""
+        """Move cursor down one row; append a new row at the end if allowed."""
         if not self._view_indices:
+            if self.on_need_new_row:
+                self.on_need_new_row()
             return
         if self.row < len(self._view_indices) - 1:
             self.row += 1
             self.ensure_visible()
-        else:
-            self.set_status("End of data")
+        elif self.on_need_new_row:
+            self.on_need_new_row()
         self._ensure_coedit_column()
 
     def move_up(self):
@@ -2747,6 +2891,15 @@ class Grid:
         dispatch = {
             curses.KEY_DOWN: self.move_down,
             curses.KEY_UP: self.move_up,
+            # Insert row before the cursor.  Windows/PuTTY terminals report
+            # Ctrl+Insert as KEY_IC or the extended 477, so this covers
+            # Insert and Ctrl+Insert.
+            curses.KEY_IC: self.insert_row_here,
+            KEY_CTL_INSERT: self.insert_row_here,
+            # Delete current row.  Windows/PuTTY terminals report Ctrl+Delete
+            # as KEY_DC or the extended 527, so this covers both.
+            curses.KEY_DC: self.delete_current_row,
+            KEY_CTL_DELETE: self.delete_current_row,
             curses.KEY_RIGHT: lr_right,
             curses.KEY_LEFT: lr_left,
             curses.KEY_HOME: self.go_home,

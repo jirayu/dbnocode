@@ -176,8 +176,24 @@ def show_print_dialog(win, detail_grids, form_name: str):
     return filtered, landscape
 
 
+def _clip_thai(text, font_name, font_size, avail_pts):
+    """Trim text so it fits `avail_pts` at the given font (for Thai runs that
+    must not overflow a column)."""
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        out = ""
+        for ch in str(text):
+            if pdfmetrics.stringWidth(out + ch, font_name, font_size) > avail_pts:
+                break
+            out += ch
+        return out
+    except Exception:
+        return str(text)[:max(1, int(avail_pts // 4))]
+
+
 def export_form_pdf(form_fields, record, detail_grids, settings, title,
-                    computed_defs=None, landscape=False):
+                    computed_defs=None, landscape=False,
+                    thai_header=None, thai_lines=None):
     """Render a form record as PDF and open it.
 
     Args:
@@ -187,6 +203,10 @@ def export_form_pdf(form_fields, record, detail_grids, settings, title,
         settings: business settings dict (company_name, address_line1, ...)
         title: form title string
         computed_defs: list of {"name", "expr"} for computed fields
+        thai_header: {field_id: thai_text} — print-only Thai side data,
+                     drawn next to the English header field value
+        thai_lines: {"line_rowid:col_id": thai_text} — Thai side data for
+                    detail cells, drawn under the cell text
 
     Returns:
         pdf_path on success, error string on failure.
@@ -411,6 +431,8 @@ def export_form_pdf(form_fields, record, detail_grids, settings, title,
     # ── Start rendering ──
     y = y_top
     _draw_header()
+    thai_header = thai_header or {}
+    thai_lines = thai_lines or {}
 
     # ── Header fields — 2-column layout ──
     col_w = usable_w / 2 - 5
@@ -458,7 +480,22 @@ def export_form_pdf(form_fields, record, detail_grids, settings, title,
             c.drawString(x, y - label_size, f"{label}:")
             c.setFillColorRGB(0, 0, 0)
             c.setFont(font_name, value_size)
-            c.drawString(x + label_w, y - value_size, _fmt_value(val, f))
+            val_text = _fmt_value(val, f)
+            c.drawString(x + label_w, y - value_size, val_text)
+            thai = thai_header.get(fid, "")
+            if thai:
+                try:
+                    vx = (x + label_w
+                          + pdfmetrics.stringWidth(val_text, font_name,
+                                                   value_size) + 8)
+                    c.setFont(font_name, value_size - 1)
+                    c.setFillColorRGB(0, 0, 0.55)
+                    c.drawString(vx, y - value_size,
+                                 _clip_thai(thai, font_name, value_size - 1,
+                                            margin + usable_w - vx))
+                    c.setFillColorRGB(0, 0, 0)
+                except Exception:
+                    pass
             y -= row_height
         else:
             # 2-column field
@@ -472,7 +509,22 @@ def export_form_pdf(form_fields, record, detail_grids, settings, title,
             c.drawString(x, y - label_size, f"{label}:")
             c.setFillColorRGB(0, 0, 0)
             c.setFont(font_name, value_size)
-            c.drawString(x + label_w, y - value_size, _fmt_value(val, f))
+            val_text = _fmt_value(val, f)
+            c.drawString(x + label_w, y - value_size, val_text)
+            thai = thai_header.get(fid, "")
+            if thai:
+                try:
+                    vx = (x + label_w
+                          + pdfmetrics.stringWidth(val_text, font_name,
+                                                   value_size) + 8)
+                    c.setFont(font_name, value_size - 1)
+                    c.setFillColorRGB(0, 0, 0.55)
+                    c.drawString(vx, y - value_size,
+                                 _clip_thai(thai, font_name, value_size - 1,
+                                            x + col_w - vx))
+                    c.setFillColorRGB(0, 0, 0)
+                except Exception:
+                    pass
 
             cur_col += 1
             if cur_col >= 2:
@@ -544,13 +596,25 @@ def export_form_pdf(form_fields, record, detail_grids, settings, title,
         y -= hdr_h
         c.setFillColorRGB(0, 0, 0)
 
-        # Data rows
+        # Data rows.  Rows with a value in the key column (part_no, or the
+        # first visible column when the grid has no part_no) are numbered
+        # document lines.  Rows without one are continuation lines (extra
+        # part_name text typed below a line): no sequence number, blank
+        # numeric cells, and no totals contribution.
+        key_id = "part_no"
+        if not any("part_no" in r for r in dg_data):
+            key_id = visible_cols[0]["id"]
         totals = {}
+        seq = 0
         for ri, row_data in enumerate(dg_data):
             _check_space(detail_row_height + 2)
+            is_line = bool(str(row_data.get(key_id, "") or "").strip())
+            if is_line:
+                seq += 1
 
-            # Alternating row background
-            if ri % 2 == 1:
+            # Alternating stripe follows the real-line number, so a line
+            # and its continuation rows share the same background.
+            if seq % 2 == 0:
                 c.setFillColorRGB(0.95, 0.95, 0.95)
                 c.rect(margin, y - detail_row_height, usable_w,
                        detail_row_height, fill=1, stroke=0)
@@ -558,8 +622,9 @@ def export_form_pdf(form_fields, record, detail_grids, settings, title,
 
             c.setFont(font_name, detail_font_size)
             dx = margin + 2
-            # Sequence number
-            c.drawString(dx, y - detail_row_height + 2, str(ri + 1))
+            # Sequence number — only on real document lines
+            if is_line:
+                c.drawString(dx, y - detail_row_height + 2, str(seq))
             dx += seq_w
 
             for ci, col in enumerate(visible_cols):
@@ -569,19 +634,35 @@ def export_form_pdf(form_fields, record, detail_grids, settings, title,
                 raw = row_data.get(cid, "")
 
                 if is_num:
-                    disp = _fmt_num(raw)
-                    c.drawRightString(dx + cw - 2, y - detail_row_height + 2,
-                                      disp[:int(cw // 4)])
-                    # Accumulate totals
-                    try:
-                        totals[cid] = totals.get(cid, 0) + float(
-                            str(raw).replace(",", "") or 0)
-                    except (ValueError, TypeError):
-                        pass
+                    if is_line:
+                        disp = _fmt_num(raw)
+                        c.drawRightString(dx + cw - 2, y - detail_row_height + 2,
+                                          disp[:int(cw // 4)])
+                        # Accumulate totals — real lines only
+                        try:
+                            totals[cid] = totals.get(cid, 0) + float(
+                                str(raw).replace(",", "") or 0)
+                        except (ValueError, TypeError):
+                            pass
+                    # Continuation row: numeric cells stay blank
                 else:
                     disp = str(raw or "")
                     c.drawString(dx, y - detail_row_height + 2,
                                  disp[:int(cw // 4)])
+                # Thai memo for this line+column — small text under the cell
+                line_rid = row_data.get("rowid") or row_data.get("_rowid")
+                thai = (thai_lines or {}).get(f"{line_rid}:{cid}")
+                if thai and not is_num:
+                    try:
+                        c.setFont(font_name, detail_font_size - 1)
+                        c.setFillColorRGB(0, 0, 0.55)
+                        c.drawString(dx + 1, y - detail_row_height + 1,
+                                     _clip_thai(thai, font_name,
+                                                detail_font_size - 1, cw - 3))
+                        c.setFillColorRGB(0, 0, 0)
+                        c.setFont(font_name, detail_font_size)
+                    except Exception:
+                        pass
                 dx += cw
 
             y -= detail_row_height

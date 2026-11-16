@@ -98,7 +98,9 @@ echo ==================================================
 set SRV_INCLUDES=--hidden-import=websockets --hidden-import=websockets.asyncio --hidden-import=websockets.asyncio.server --hidden-import=websockets.headers --hidden-import=websockets.uri --hidden-import=websockets.frames --hidden-import=websockets.http11 --hidden-import=websockets.legacy --hidden-import=websockets.streams --hidden-import=websockets.sync --hidden-import=websockets.typing --hidden-import=websockets.version
 python -c "import fdb" >nul 2>&1 && set SRV_INCLUDES=%SRV_INCLUDES% --hidden-import=fdb --hidden-import=fdb.fbcore
 python -c "import psycopg2" >nul 2>&1 && set SRV_INCLUDES=%SRV_INCLUDES% --hidden-import=psycopg2 --hidden-import=psycopg2.extensions --hidden-import=psycopg2.extras --hidden-import=psycopg2.sql
-pyinstaller --onefile --clean --name dbnocode-server %UPX_ARG% %SRV_INCLUDES% server.py
+REM Bundle dsl_lib package (server.py imports dsl_lib.adapters lazily) and docstore module
+set SRV_DATA=--add-data "dsl_lib;dsl_lib" --add-data "docstore.py;."
+pyinstaller --onefile --clean --name dbnocode-server %UPX_ARG% %SRV_INCLUDES% %SRV_DATA% server.py
 if %errorlevel% neq 0 (
     echo Server build failed!
     pause
@@ -110,7 +112,7 @@ echo.
 echo ==================================================
 echo Step 7: Building Firebird-only server EXE...
 echo ==================================================
-pyinstaller --onefile --clean --name dbnocode-fbserver %UPX_ARG% %SRV_INCLUDES% FBServer.py
+pyinstaller --onefile --clean --name dbnocode-fbserver %UPX_ARG% %SRV_INCLUDES% %SRV_DATA% FBServer.py
 if %errorlevel% neq 0 (
     echo Firebird server build failed!
     pause
@@ -120,13 +122,27 @@ echo Firebird server EXE built successfully.
 echo.
 
 echo ==================================================
+echo Step 8: Building Firebird DocStore server EXE...
+echo ==================================================
+set SRV_DS_INCLUDES=%SRV_INCLUDES% --hidden-import=docstore --hidden-import=firebird.driver
+pyinstaller --onefile --clean --name dbnocode-fbserver-docstore %UPX_ARG% %SRV_DS_INCLUDES% %SRV_DATA% FBServerDocStore.py
+if %errorlevel% neq 0 (
+    echo Firebird DocStore server build failed!
+    pause
+    exit /b 1
+)
+echo Firebird DocStore server EXE built successfully.
+echo.
+
+echo ==================================================
 echo ALL BUILDS COMPLETE!
 echo ==================================================
 echo Output files:
-echo   - dist\dsl_tui_app.exe       runtime
-echo   - dist\dbnocode_init.exe     distribute to end users
-echo   - dist\dbnocode-server.exe   SQL server, all backends
-echo   - dist\dbnocode-fbserver.exe SQL server, Firebird only
+echo   - dist\dsl_tui_app.exe               runtime
+echo   - dist\dbnocode_init.exe             distribute to end users
+echo   - dist\dbnocode-server.exe           SQL server, all backends
+echo   - dist\dbnocode-fbserver.exe         SQL server, Firebird only
+echo   - dist\dbnocode-fbserver-docstore.exe SQL server, Firebird DocStore only
 echo.
 if not "%AUTOB_BUILD%"=="1" pause
 exit /b 0

@@ -4,6 +4,19 @@ from typing import Dict, List, Any, Optional, Callable
 from datetime import date
 from .themes import CLR_FORM_INPUT
 
+try:
+    from .thai_util import has_thai, strip_thai
+except ImportError:  # direct-script execution
+    from thai_util import has_thai, strip_thai
+
+
+def _screen_value(v) -> str:
+    """Screen representation of a value — Thai characters are stripped and
+    the English/ASCII part is shown as-is (Thai combining marks break
+    curses column math). The underlying value keeps the real Thai text,
+    which the Alt-L popup edits and the PDF prints."""
+    return strip_thai(str(v or ""))
+
 
 def _fmt_num(val):
     """Format a numeric value cleanly: no trailing .0, blank for 0, commas."""
@@ -38,7 +51,7 @@ class BaseWidget:
             self.on_change(val)
 
     def draw(self, stdscr):
-        display = str(self.value or "")[:self.width].ljust(self.width)
+        display = _screen_value(self.value)[:self.width].ljust(self.width)
         attr = curses.color_pair(CLR_FORM_INPUT) | curses.A_REVERSE if self.focused else curses.color_pair(CLR_FORM_INPUT) | curses.A_UNDERLINE
         stdscr.addstr(self.y, self.x, display, attr)
 
@@ -71,7 +84,7 @@ class TextInput(BaseWidget):
         self.set_value(self.buffer)
 
     def draw(self, stdscr):
-        display = self.buffer[:self.width].ljust(self.width)
+        display = _screen_value(self.buffer)[:self.width].ljust(self.width)
         attr = curses.color_pair(CLR_FORM_INPUT) | curses.A_REVERSE if self.focused else curses.color_pair(CLR_FORM_INPUT) | curses.A_UNDERLINE
         stdscr.addstr(self.y, self.x, display, attr)
 
@@ -157,7 +170,7 @@ class MultiLineInput(BaseWidget):
 
     def draw(self, stdscr):
         for i in range(self.rows):
-            line = self._lines[i][:self.width].ljust(self.width)
+            line = _screen_value(self._lines[i])[:self.width].ljust(self.width)
             if self.focused and i == self._line_idx:
                 attr = curses.color_pair(CLR_FORM_INPUT) | curses.A_REVERSE
             elif self.focused:
@@ -768,7 +781,8 @@ class SearchDialog:
              data: List[Dict], display_field: str = "name",
              value_field: str = "code", title: str = "Search",
              list_columns: list = None,
-             current_value: str = None) -> Optional[Dict]:
+             current_value: str = None,
+             initial_search: str = "") -> Optional[Dict]:
         if not data:
             # Show "No records" message popup
             SearchDialog._init_colors()
@@ -861,7 +875,7 @@ class SearchDialog:
             return None
         popup.keypad(True)
 
-        search = ""
+        search = initial_search or ""
         cur = 0
         scroll = 0
         filtered = list(data)
@@ -902,6 +916,10 @@ class SearchDialog:
                                    if k not in ("rowid", "_parent_rowid"))]
             cur = 0
             scroll = 0
+
+        if search:
+            # Opened with a type-ahead character (grid "start typing" lookup).
+            _filter()
 
         def _auto_confirm_single():
             """Return True and set result if exactly one match on non-identity fields."""
@@ -1131,7 +1149,7 @@ class Combobox(BaseWidget):
 
     def draw(self, stdscr):
         self._stdscr = stdscr
-        display = str(self.options[self.sel_idx]) if self.options else ""
+        display = _screen_value(self.options[self.sel_idx]) if self.options else ""
         indicator = " [v]" if self.focused else "    "
         text = display + indicator
         attr = curses.color_pair(CLR_FORM_INPUT) | curses.A_REVERSE if self.focused else curses.color_pair(CLR_FORM_INPUT) | curses.A_UNDERLINE
@@ -1199,7 +1217,7 @@ class LookupField(BaseWidget):
     def draw(self, stdscr):
         self._stdscr = stdscr
         # Show the actual value (e.g. "PO-0001"), not the display_field
-        display = str(self.value or "")
+        display = _screen_value(self.value)
         attr = curses.color_pair(CLR_FORM_INPUT) | curses.A_REVERSE if self.focused else curses.color_pair(CLR_FORM_INPUT) | curses.A_UNDERLINE
         stdscr.addstr(self.y, self.x, display.ljust(self.width)[:self.width], attr)
         btn_attr = curses.A_BOLD if self.focused else 0

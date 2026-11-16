@@ -17,6 +17,7 @@ Can be packaged with PyInstaller:
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -116,6 +117,49 @@ def _company_adapter(company):
     return str((company or {}).get("adapter") or "sqlite").strip().lower()
 
 
+def _access_password(company):
+    """Required connection password for a company, or "" when open access.
+
+    Stored in the company profile as ``access_password``. When set, a client
+    must send it as the ``jwt`` field of its Hrana ``hello`` message.
+    """
+    return str((company or {}).get("access_password") or "")
+
+
+def _bind_host(company):
+    """Address the server binds, defaulting to localhost only."""
+    return (company or {}).get("bind_host") or "127.0.0.1"
+
+
+def _websocket_origin(websocket):
+    """Return the HTTP Origin header of the upgrade request, or None."""
+    request = getattr(websocket, "request", None)
+    headers = getattr(request, "headers", None)
+    if headers is None:  # legacy websockets >=10 asyncio client API
+        headers = getattr(websocket, "handshake_headers", None)
+    try:
+        return headers.get("origin")
+    except AttributeError:
+        return None
+
+
+_LOCAL_ORIGINS = ("localhost", "127.0.0.1", "::1")
+
+
+def _origin_allowed(origin):
+    """Only accept browser-originated connections from localhost.
+
+    Native clients (TUI, sqld, most tools) send no Origin header; browsers
+    always send one. Rejecting non-localhost origins closes cross-site
+    WebSocket hijacking while leaving local tooling and LAN-native clients
+    (with an access password) working.
+    """
+    if not origin:
+        return True
+    host = urlparse(origin).hostname or ""
+    return host.lower() in _LOCAL_ORIGINS
+
+
 def _resolve_sqlite_db_path(company):
     """Resolve the SQLite file path served for a company."""
     db_file = (company or {}).get("db_file", "") or (company or {}).get("db_name", "")
@@ -141,6 +185,12 @@ def _company_database_display(company):
         port = fb.get("port", 3050)
         db = fb.get("database", "")
         return f"firebird://{host}:{port}/{db}"
+    if adapter == "firebird-docstore":
+        fb = _fb_config_from_company(company)
+        host = fb.get("host", "localhost")
+        port = fb.get("port", 3050)
+        db = fb.get("database", "")
+        return f"firebird-docstore://{host}:{port}/{db}"
     return _resolve_sqlite_db_path(company)
 
 
@@ -210,16 +260,8 @@ def _fb_connect(company):
 
     try:
         conn = _connect_with_credentials(user, password)
-    except fdb.fbcore.DatabaseError as e:
-        err_text = str(e).lower()
-        if ("user name and password are not defined" in err_text
-                and isinstance(password, str)
-                and password.lower() == "masterkey"
-                and password != "masterkey"):
-            conn = _connect_with_credentials(user, "masterkey")
-            company["password"] = "masterkey"
-            company["fb_password"] = "masterkey"
-        elif is_local and database and not os.path.exists(database):
+    except fdb.fbcore.DatabaseError:
+        if is_local and database and not os.path.exists(database):
             db_dir = os.path.dirname(database)
             if db_dir:
                 os.makedirs(db_dir, exist_ok=True)
@@ -462,6 +504,17 @@ def _connect_backend(company):
     if adapter == "firebird":
         conn, fb_major = _fb_connect(company)
         return conn, {"adapter": adapter, "fb_major": fb_major}
+    if adapter == "firebird-docstore":
+        from dsl_lib.adapters import FirebirdDocStoreAdapter
+        store = FirebirdDocStoreAdapter(
+            host=company.get("fb_host", company.get("host", "localhost")),
+            port=int(company.get("fb_port", company.get("port", 3050))),
+            db=company.get("fb_database", company.get("database", "")),
+            user=company.get("fb_user", company.get("user", "sysdba")),
+            pwd=company.get("fb_password", company.get("password", "masterkey")),
+        )
+        store.connect()
+        return store, {"adapter": adapter}
     db_path = _resolve_sqlite_db_path(company)
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -707,6 +760,103 @@ def _execute_stmt_firebird(conn, stmt, in_txn, fb_major=5):
             pass
 
 
+def _execute_stmt_docstore(store, stmt, in_txn):
+    """Execute a Hrana statement on a FirebirdDocStoreAdapter.
+
+    Translates the SQL patterns the runner sends
+    (``SELECT rowid, data FROM "table"`` / ``INSERT`` / ``UPDATE`` /
+    ``DELETE`` / ``CREATE TABLE``) into adapter ``query``/``execute`` calls,
+    and converts results back into Hrana response format.
+    """
+    sql = (stmt or {}).get("sql", "")
+    args = [_from_hrana_value(a) for a in (stmt or {}).get("args", [])]
+    want_rows = (stmt or {}).get("want_rows", True)
+    upper = sql.strip().upper()
+
+    # Transaction control
+    if upper in ("BEGIN", "BEGIN TRANSACTION", "BEGIN IMMEDIATE",
+                 "BEGIN DEFERRED", "BEGIN EXCLUSIVE"):
+        store.begin()
+        return {
+            "affected_row_count": 0, "last_insert_rowid": None,
+            "cols": [], "rows": [],
+        }, True
+    if upper in ("COMMIT", "COMMIT TRANSACTION"):
+        store.commit()
+        return {
+            "affected_row_count": 0, "last_insert_rowid": None,
+            "cols": [], "rows": [],
+        }, False
+    if upper in ("ROLLBACK", "ROLLBACK TRANSACTION"):
+        store.rollback()
+        return {
+            "affected_row_count": 0, "last_insert_rowid": None,
+            "cols": [], "rows": [],
+        }, False
+
+    if upper.startswith("CREATE TABLE"):
+        # DocStore uses shared NC_DOC/NC_IDX — nothing to create per table.
+        if not in_txn:
+            store.con.commit()
+        return {
+            "affected_row_count": 0, "last_insert_rowid": None,
+            "cols": [], "rows": [],
+        }, in_txn
+
+    if upper.startswith("SELECT"):
+        # SELECT rowid, data FROM "table" [WHERE rowid = ?]
+        rows = store.query(sql, tuple(args))
+        result = {
+            "affected_row_count": len(rows),
+            "last_insert_rowid": None,
+        }
+        if want_rows and rows:
+            result["cols"] = [{"name": "rowid"}, {"name": "data"}]
+            result["rows"] = [
+                [_to_hrana_value(r["rowid"]), _to_hrana_value(r["data"])]
+                for r in rows
+            ]
+        else:
+            result["cols"] = []
+            result["rows"] = []
+        return result, in_txn
+
+    if upper.startswith("INSERT"):
+        rc, lastrowid = store.execute(sql, tuple(args))
+        if not in_txn:
+            store.con.commit()
+        return {
+            "affected_row_count": rc,
+            "last_insert_rowid": str(lastrowid) if lastrowid else None,
+            "cols": [], "rows": [],
+        }, in_txn
+
+    if upper.startswith("UPDATE"):
+        rc, lastrowid = store.execute(sql, tuple(args))
+        if not in_txn:
+            store.con.commit()
+        return {
+            "affected_row_count": rc,
+            "last_insert_rowid": str(lastrowid) if lastrowid else None,
+            "cols": [], "rows": [],
+        }, in_txn
+
+    if upper.startswith("DELETE"):
+        rc, lastrowid = store.execute(sql, tuple(args))
+        if not in_txn:
+            store.con.commit()
+        return {
+            "affected_row_count": rc,
+            "last_insert_rowid": None,
+            "cols": [], "rows": [],
+        }, in_txn
+
+    return {
+        "affected_row_count": 0, "last_insert_rowid": None,
+        "cols": [], "rows": [],
+    }, in_txn
+
+
 def _execute_stmt(conn, stmt, in_txn, backend=None):
     """Execute a Hrana statement on the selected backend connection."""
     adapter = (backend or {}).get("adapter", "sqlite")
@@ -715,26 +865,25 @@ def _execute_stmt(conn, stmt, in_txn, backend=None):
     if adapter == "firebird":
         return _execute_stmt_firebird(
             conn, stmt, in_txn, (backend or {}).get("fb_major", 5))
+    if adapter == "firebird-docstore":
+        return _execute_stmt_docstore(conn, stmt, in_txn)
     return _execute_stmt_sqlite(conn, stmt, in_txn)
 
 
 async def _handle_client(websocket, company, server_name=""):
-    """Handle one Hrana 2 WebSocket client connection."""
-    try:
-        conn, adapter = _connect_backend(company)
-    except Exception as e:
-        _log_activity(server_name, "ERROR", f"DB connect failed: {e}")
-        try:
-            await websocket.send(json.dumps({
-                "type": "hello_error",
-                "error": {"message": str(e)},
-            }))
-        except Exception:
-            pass
-        await websocket.close(code=1011, reason=str(e)[:120])
-        return
+    """Handle one Hrana 2 WebSocket client connection.
+
+    The first message must be ``hello`` with a matching ``jwt`` when the
+    company profile defines ``access_password``. The backend connection is
+    opened only after the hello is accepted, so unauthenticated peers never
+    reach the database.
+    """
+    expected_password = _access_password(company)
+    authenticated = False
     streams = set()
     in_txn = False  # tracks explicit BEGIN/COMMIT state
+    conn = None
+    adapter = None
     remote = ""
     try:
         remote = websocket.remote_address
@@ -742,77 +891,114 @@ async def _handle_client(websocket, company, server_name=""):
             remote = f"{remote[0]}:{remote[1]}"
     except Exception:
         remote = "unknown"
-    _log_activity(server_name, "CONNECT", str(remote))
+
+    async def _send_json(payload):
+        await websocket.send(json.dumps(payload))
+
+    async def _hello_error(message, close_code=1011):
+        _log_activity(server_name, "DENIED", f"{remote}  ({message})")
+        try:
+            await _send_json({
+                "type": "hello_error",
+                "error": {"message": message},
+            })
+        except Exception:
+            pass
+        await websocket.close(code=close_code,
+                              reason=message[:120])
 
     try:
         async for raw_msg in websocket:
             try:
                 msg = json.loads(raw_msg)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 continue
 
             msg_type = msg.get("type")
 
             if msg_type == "hello":
-                # No auth check for local server
-                await websocket.send(json.dumps({"type": "hello_ok"}))
+                if authenticated:
+                    await _send_json({"type": "hello_ok"})
+                    continue
+                supplied = msg.get("jwt") or ""
+                if expected_password and not hmac.compare_digest(
+                        str(supplied), expected_password):
+                    await _hello_error(
+                        "Access denied: connection password required or "
+                        "incorrect (set access_password in the company "
+                        "profile).", close_code=4401)
+                    break
+                # Authenticated — now open the backend.
+                try:
+                    conn, adapter = _connect_backend(company)
+                except Exception as e:
+                    _log_activity(server_name, "ERROR",
+                                  f"DB connect failed: {e}")
+                    await _hello_error(f"DB connect failed: {e}")
+                    break
+                authenticated = True
+                _log_activity(server_name, "CONNECT", str(remote))
+                await _send_json({"type": "hello_ok"})
 
             elif msg_type == "request":
-                req_id = msg["request_id"]
-                req = msg["request"]
-                req_type = req["type"]
+                if not authenticated or conn is None:
+                    continue  # ignore requests until hello is accepted
+                req_id = msg.get("request_id")
+                req = msg.get("request") or {}
+                req_type = req.get("type")
 
                 try:
                     if req_type == "open_stream":
-                        stream_id = req["stream_id"]
+                        stream_id = req.get("stream_id")
                         streams.add(stream_id)
-                        await websocket.send(json.dumps({
+                        await _send_json({
                             "type": "response_ok",
                             "request_id": req_id,
                             "response": {},
-                        }))
+                        })
 
                     elif req_type == "close_stream":
-                        stream_id = req["stream_id"]
+                        stream_id = req.get("stream_id")
                         streams.discard(stream_id)
-                        await websocket.send(json.dumps({
+                        await _send_json({
                             "type": "response_ok",
                             "request_id": req_id,
                             "response": {},
-                        }))
+                        })
 
                     elif req_type == "execute":
-                        sql = req["stmt"].get("sql", "")
+                        sql = (req.get("stmt") or {}).get("sql", "")
                         result, in_txn = _execute_stmt(
-                            conn, req["stmt"], in_txn, adapter)
+                            conn, req.get("stmt") or {}, in_txn, adapter)
                         rows = len(result.get("rows", []))
                         sql_short = sql[:80] + ("..." if len(sql) > 80 else "")
                         _log_activity(server_name, "SQL",
                                       f"{sql_short}  ({rows} rows)")
-                        await websocket.send(json.dumps({
+                        await _send_json({
                             "type": "response_ok",
                             "request_id": req_id,
                             "response": {"result": result},
-                        }))
+                        })
 
                     else:
-                        await websocket.send(json.dumps({
+                        await _send_json({
                             "type": "response_error",
                             "request_id": req_id,
                             "error": {"message": f"Unknown request type: {req_type}"},
-                        }))
+                        })
 
                 except Exception as e:
                     _log_activity(server_name, "ERROR", str(e)[:120])
-                    await websocket.send(json.dumps({
+                    await _send_json({
                         "type": "response_error",
                         "request_id": req_id,
                         "error": {"message": str(e)},
-                    }))
+                    })
     except Exception:
         pass
     finally:
-        _log_activity(server_name, "DISCONNECT", str(remote))
+        if authenticated:
+            _log_activity(server_name, "DISCONNECT", str(remote))
         try:
             conn.close()
         except Exception:
@@ -828,15 +1014,35 @@ async def _run_server(port, company, stop_event, name):
         _log("  ERROR: 'websockets' package required. pip install websockets")
         return
 
+    bind_host = _bind_host(company)
+    requires_password = bool(_access_password(company))
+    if (not requires_password
+            and bind_host not in ("127.0.0.1", "::1", "localhost")):
+        _log(f"  WARNING: {name} is listening on {bind_host} WITHOUT an "
+             f"access password. Set 'access_password' in the company "
+             f"profile to require one.")
+
     async def handler(websocket):
+        origin = _websocket_origin(websocket)
+        if not _origin_allowed(origin):
+            _log_activity(name, "DENIED",
+                          f"origin '{origin}' not allowed "
+                          f"(cross-site WebSocket hijacking guard)")
+            await websocket.close(
+                code=1008,
+                reason="Browser-originated connections are only allowed "
+                       "from localhost")
+            return
         await _handle_client(websocket, company, name)
 
     try:
-        # Bind both IPv4 and IPv6 so "localhost" resolves fast on Windows
-        # (Windows resolves localhost to ::1 first, then 127.0.0.1)
-        async with serve(handler, "", port,
+        # Bind localhost by default. Set "bind_host" in the company profile
+        # (e.g. "0.0.0.0" with an "access_password") to accept other
+        # interfaces deliberately.
+        async with serve(handler, bind_host, port,
                          subprotocols=["hrana2"]) as server:
-            _log(f"  {name}: listening on port {port} "
+            _log(f"  {name}: listening on {bind_host}:{port} "
+                 f"({'password required' if requires_password else 'open (localhost only)'}) "
                  f"(db: {_company_database_display(company)})")
             while not stop_event.is_set():
                 await asyncio.sleep(0.5)
@@ -1435,6 +1641,14 @@ class ServerManagerGUI:
         dbname_entry = tk.Entry(form_frame, textvariable=dbname_var, **entry_kw)
         dbname_entry.pack(**pad)
 
+        tk.Label(form_frame,
+                 text="Access Password (clients must supply it; empty = none):",
+                 font=("Segoe UI", 10)).pack(fill="x", **pad)
+        access_var = tk.StringVar(value=company.get("access_password", ""))
+        access_entry = tk.Entry(form_frame, textvariable=access_var,
+                                show="*", **entry_kw)
+        access_entry.pack(**pad)
+
         tk.Label(form_frame, text="Postgres Host / IP:",
                  font=("Segoe UI", 10)).pack(fill="x", **pad)
         pg_host_var = tk.StringVar(value=company.get("host", "localhost"))
@@ -1543,6 +1757,7 @@ class ServerManagerGUI:
                 "company": name,
                 "db_url": f"ws://{ws_host}:{ws_port}",
                 "active": active_var.get(),
+                "access_password": access_var.get(),
             }
             if adapter == "postgres":
                 pg_host = pg_host_var.get().strip() or "localhost"
@@ -1730,9 +1945,16 @@ def interactive_menu(companies_file, companies):
                 adapter = input("  Adapter [sqlite/postgres/firebird] (default sqlite): ").strip().lower() or "sqlite"
                 host = input("  WebSocket host (default localhost): ").strip() or "localhost"
                 port = input("  WebSocket port (e.g. 8081): ").strip()
+                access_pwd = input("  Access password (optional, empty = none): ").strip()
                 if name and port:
                     db_url = f"ws://{host}:{port}"
-                    entry = {"company": name, "db_url": db_url, "active": False}
+                    entry = {"company": name, "db_url": db_url,
+                             "active": False,
+                             "access_password": access_pwd}
+                    if not access_pwd and host not in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+                        print("  Note: no access password set; the server "
+                              "only accepts localhost connections until "
+                              "'bind_host' is configured.")
                     if adapter == "postgres":
                         pg_host = input("  Postgres host (default localhost): ").strip() or "localhost"
                         pg_port = input("  Postgres port (default 5432): ").strip() or "5432"
@@ -1810,6 +2032,8 @@ def main():
         save_companies(companies_file, companies)
         print(f"  Created default config: {companies_file}")
         print(f"  Company: Default  |  ws://localhost:8081")
+        print(f"  Tip: add 'access_password' to a company entry (or the "
+              f"GUI field) to require clients to authenticate.")
         print()
     else:
         companies = load_companies(companies_file)

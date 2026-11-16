@@ -50,7 +50,18 @@ FORM put_away TITLE "Put-Away List" COLS 2
     lot_no      | 12 | ro
   END DETAIL
   SCRIPT confirm_pa
-    OK "Put-Away confirmed"
+    IF COUNT(lines) = 0
+      FAIL "No lines to confirm."
+    END
+    SET _updated = 0
+    FOREACH ln IN lines
+      FETCH ws FROM warehouse_storage WHERE part_no = ln.part_no AND grn_no = grn_no AND location = ln.loc_id
+      IF NOT ISBLANK(ws.part_no)
+        UPDATE warehouse_storage SET pa_no = pa_no WHERE part_no = ln.part_no AND grn_no = grn_no AND location = ln.loc_id
+        SET _updated = _updated + 1
+      END
+    END
+    OK "Put-Away confirmed. " + STR(_updated) + " storage rows linked."
   ENDSCRIPT
   WORKFLOW ON status
     Draft > Confirmed : confirm_pa

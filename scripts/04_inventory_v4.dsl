@@ -96,7 +96,7 @@ FORM grn COLS 2
       IF po_number
         UPDATE item SET on_order = item.on_order - line.received_qty WHERE _rowid = item._rowid
         FETCH po_rec FROM po WHERE po_number = po_number
-        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND _parent_rowid = po_rec._rowid
+        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND unit_cost = line.unit_cost AND _parent_rowid = po_rec._rowid
         UPDATE po_line SET received_qty = po_ln.received_qty + line.received_qty WHERE _rowid = po_ln._rowid
       END
       INSERT item_card SET trans_date = grn_date, trans_type = "RECV", doc_no = grn_no, receive_qty = line.received_qty, issue_qty = 0, balance = item.on_hand, unit_cost = line.unit_cost, _parent_rowid = item._rowid
@@ -109,7 +109,7 @@ FORM grn COLS 2
       IF po_number
         UPDATE item SET on_order = item.on_order + line.received_qty WHERE _rowid = item._rowid
         FETCH po_rec FROM po WHERE po_number = po_number
-        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND _parent_rowid = po_rec._rowid
+        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND unit_cost = line.unit_cost AND _parent_rowid = po_rec._rowid
         UPDATE po_line SET received_qty = po_ln.received_qty - line.received_qty WHERE _rowid = po_ln._rowid
       END
       INSERT item_card SET trans_date = grn_date, trans_type = "VOID-R", doc_no = grn_no, receive_qty = 0, issue_qty = line.received_qty, balance = item.on_hand, unit_cost = line.unit_cost, _parent_rowid = item._rowid

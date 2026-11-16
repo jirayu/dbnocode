@@ -2,6 +2,8 @@ import re
 from typing import List, Dict, Any, Set
 from dataclasses import dataclass
 
+from dsl_lib._text import strip_comments
+
 @dataclass
 class ValidationError:
     code: str; message: str; line: int=0; fix: str=""
@@ -56,7 +58,7 @@ class DSLValidator:
         # Preserve original line numbers by keeping (line_num, stripped_content) pairs
         self.lines = []
         for i, raw_line in enumerate(text.splitlines(), 1):
-            stripped = re.sub(r'//.*', '', raw_line).strip()
+            stripped = strip_comments(raw_line).strip()
             if stripped:
                 self.lines.append((i, stripped))
 
@@ -125,9 +127,14 @@ class DSLValidator:
         for orig_line_num, l in self.lines:
             self.line_num = orig_line_num
             if "HOTKEY" in l:
-                m = re.search(r'HOTKEY\s+"([^"]+)"', l, re.I)
-                if m and m.group(1) not in ALLOWED_HOTKEYS:
-                    self._error("INVALID_HOTKEY", f"Bad hotkey: {m.group(1)}", f"Use one of: {ALLOWED_HOTKEYS}")
+                # Accept HOTKEY F2 and HOTKEY "F2" — strip quotes before the
+                # allowlist check (compact menus store the unquoted value).
+                m = re.search(r'HOTKEY\s+("([^"]+)"|(\S+))', l, re.I)
+                if m:
+                    hotkey = (m.group(2) or m.group(3) or "").strip('"').upper()
+                    if hotkey not in ALLOWED_HOTKEYS:
+                        self._error("INVALID_HOTKEY", f"Bad hotkey: {hotkey}",
+                                    f"Use one of: {', '.join(sorted(ALLOWED_HOTKEYS))}")
             if "RUN" in l:
                 m = re.search(r'RUN\s+"([^"]+)"', l, re.I)
                 if m and m.group(1) not in self.declared["actions"]:
@@ -148,6 +155,7 @@ class DSLValidator:
                   "COMPUTED": "COMPUTED", "HIGHLIGHT": "HIGHLIGHT", "LISTVIEW": "LISTVIEW",
                   "SCRIPT": "SCRIPT", "STOCK": "STOCK", "TREE_DETAIL": "TREE_DETAIL",
                   "COLUMNS": "COLUMNS", "CROSSTAB": "CROSSTAB", "GROUP": "GROUP",
+                  "PULLDOWN": "PULLDOWN", "PARAMS": "PARAMS",
                   "CENTER": "CENTER", "SAVE": "SAVE", "FOR": "FOR",
                   "FOREACH": "FOREACH", "IF": "IF", "WRITE": "WRITE"}
         for number, line in self.lines:
@@ -155,7 +163,11 @@ class DSLValidator:
             if up.startswith("END ") or up in ("END", "ENDSCRIPT", "ENDSUBROUTINE"):
                 token = up.replace("ENDSCRIPT", "SCRIPT").replace("ENDSUBROUTINE", "SUBROUTINE")
                 name = token[4:].strip() if token.startswith("END ") else ("" if token == "END" else token)
-                if not stack or (name and name != stack[-1]):
+                # The parser accepts both `END` and `END GROUP` closing a
+                # PULLDOWN group; mirror that so END GROUP is not a false
+                # positive inside MENU blocks.
+                if (not stack or (name and name != stack[-1]
+                        and not (name == "GROUP" and stack[-1] == "PULLDOWN"))):
                     self.line_num = number
                     self._error("MALFORMED_TERMINATOR", f"Unexpected compact block terminator '{line}'")
                 else:
@@ -165,9 +177,11 @@ class DSLValidator:
             if up.startswith("ON SAVE"):
                 stack.append("SAVE")
                 continue
-            # Field lines are `name | width | flags`; a slug such as `stock`
-            # or `detail` would otherwise be misread as a block header.
-            if " | " in line:
+            # Field/param lines are `name | width | flags`. Detect them
+            # structurally by the presence of '|' rather than the exact
+            # " | " variant, so a slug like `stock` written as
+            # `stock |8| num` is not misread as a STOCK block header.
+            if "|" in line and keyword not in starts:
                 continue
             if keyword == "GROUP" and not re.search(r'GROUP\s+"', line, re.I):
                 continue
@@ -253,14 +267,6 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
                 error("INVALID_FIELD_TYPE", f"Field '{form_id}.{field.get('id', '?')}' has invalid type '{field.get('type')}'")
             if field.get("type") == "ENUM" and not field.get("enum_list"):
                 error("INVALID_ENUM", f"Field '{form_id}.{field.get('id', '?')}' has no enum values")
-            # Validate lookup: check that the referenced form(s) exist
-            if field.get("lookup"):
-                # We need to parse the lookup expression to get the form names
-                # We'll create a temporary validator to use its _parse_lookup_expression method
-                # But we don't have access to self here. We'll duplicate the logic.
-                # Alternatively, we can define a helper function here.
-                # Let's define a helper function inside validate_app_definition.
-                pass  # We'll do this after we define the helper
 
     for grid_id, grid in grids.items():
         parent = grid.get("parent")
@@ -285,10 +291,6 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
                     not isinstance(col["readonly_below"], int)
                     or col["readonly_below"] < 0):
                 error("INVALID_PERMISSION_LEVEL", f"Grid '{grid_id}' column '{cid}' has invalid readonly_below level")
-            # Validate lookup for column
-            if col.get("lookup"):
-                # We'll do the same as for fields
-                pass
 
     for layout_id, layout in layouts.items():
         for ref in (layout.get("fields") or {}):
@@ -335,21 +337,9 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
             if script and script not in scripts and script not in (app.get("subroutines") or {}):
                 error("INVALID_WORKFLOW_SCRIPT", f"Workflow in '{layout_id}' references missing script '{script}'")
 
-    # Now we need to validate the lookup expressions in fields and columns.
-    # We'll create a helper function to parse the lookup expression and get the form names.
-    def _parse_lookup_expression(expr: str) -> List[str]:
-        if not expr:
-            return []
-        parts = expr.split("|")
-        forms = []
-        for part in parts:
-            part = part.strip()
-            if part:
-                first_word = part.split()[0]
-                forms.append(first_word)
-        return forms
-
-    # Form names in the dict use _form suffix; lookup expressions use bare names
+    # Validate lookup expressions: form names in the dict carry a "_form"
+    # suffix; lookup expressions use bare names. Unknown targets are a
+    # warning (the form may be provided by another DSL at runtime).
     form_bare_names = {k.removesuffix("_form") for k in forms}
 
     # Validate fields
@@ -358,7 +348,7 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
             if field.get("type") in {"SECTION", "SPACER"}:
                 continue
             if field.get("lookup"):
-                form_names = _parse_lookup_expression(field["lookup"])
+                form_names = DSLValidator()._parse_lookup_expression(field["lookup"])
                 for form_name in form_names:
                     if form_name not in form_bare_names:
                         # Warn only — lookup target may be in another DSL file loaded at runtime
@@ -369,7 +359,7 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
     for grid_id, grid in grids.items():
         for col in grid.get("columns", []):
             if col.get("lookup"):
-                form_names = _parse_lookup_expression(col["lookup"])
+                form_names = DSLValidator()._parse_lookup_expression(col["lookup"])
                 for form_name in form_names:
                     if form_name not in form_bare_names:
                         # Warn only — lookup target may be in another DSL file loaded at runtime
@@ -377,6 +367,3 @@ def validate_app_definition(app: Dict[str, Any]) -> ValidationResult:
                             f"Column '{grid_id}.{col.get('id', '?')}' references unknown form '{form_name}' in lookup", 0))
 
     return result
-
-class SemanticValidator(DSLValidator):
-    pass

@@ -1,4 +1,5 @@
 import curses
+import time
 from curses.textpad import rectangle
 from typing import Dict, List, Any, Optional
 from .widgets import (BaseWidget, TextInput, MultiLineInput, Checkbox,
@@ -9,6 +10,7 @@ from .themes import (CLR_FORM_BORDER, CLR_FORM_LABEL, CLR_FORM_SECTION,
                      CLR_STATUS_BAR, CLR_HEADER)
 from .statusline import StatusLine
 from .udf_panel import UDFPanel
+from .bigtitle import BigTitleBanner
 
 # Try to import the advanced cxgrid; fall back to basic EditableGrid
 try:
@@ -26,6 +28,11 @@ try:
     HAS_TREEGRID = True
 except ImportError:
     HAS_TREEGRID = False
+
+try:
+    from .thai_util import has_thai as _has_thai
+except ImportError:
+    from thai_util import has_thai as _has_thai
 
 
 def _safe_float(v):
@@ -145,23 +152,49 @@ def _display_qty(base_qty, uom, pack_uom, pack_qty) -> float:
     return base_num
 
 
+def _trim_disp(s, width) -> str:
+    """Trim s to `width` display columns (Thai combining marks count 0)."""
+    try:
+        from .thai_util import disp_width as _dw
+    except Exception:
+        from thai_util import disp_width as _dw
+    out = ""
+    for ch in str(s):
+        if _dw(out + ch) > width:
+            break
+        out += ch
+    return out
+
+
 class LayoutRenderer:
     def __init__(self, stdscr, form_defs: Dict[str, Any], grid_defs: Dict[str, Any],
                  layout_def: Dict, lookup_data: Dict[str, List],
                  grid_data: Dict[str, List] = None, edit_context: Dict = None,
                  column_configs: Dict = None, sort_configs: Dict = None,
                  db=None, app_grids: Dict = None, default_resolver=None,
-                 user_context: Dict = None):
+                 user_context: Dict = None,
+                 menu_memory: Dict = None, layout_name: str = "",
+                 lookup_loader=None):
         self.stdscr = stdscr
         self.form_defs = form_defs
         self.grid_defs = grid_defs
         self.layout_def = layout_def
+        self.menu_memory = menu_memory
+        self.layout_name = layout_name
         self.lookup_data = lookup_data
+        self.lookup_loader = lookup_loader
+        self._lookup_reload_at = 0.0
+        self._flash_msg = ""
+        self._flash_until = 0.0
         self.grid_data = grid_data or {}
         self.edit_context = edit_context
         self.column_configs = column_configs or {}
         self.sort_configs = sort_configs or {}
         self.db = db
+        # Thai memos typed via Alt-L this session (memo_key -> Thai text).
+        # Printing merges these with the DB store; the visible field values
+        # are never touched by Alt-L.
+        self._thai_memos: Dict[str, str] = {}
         self.app_grids = app_grids or {}
         self._default_resolver = default_resolver
         self.user_context = dict(user_context or {})
@@ -180,7 +213,8 @@ class LayoutRenderer:
         self.values: Dict[str, Any] = {}
         self.menu: Optional[MenuManager] = None
         self.status_line = StatusLine(stdscr)
-        self._figlet_h = self._calc_figlet_height()
+        self._banner = self._make_banner()
+        self._banner_h = self._banner.height
         self._item_master_syncing = False
         self._init_menus()
         self._init_widgets()
@@ -223,6 +257,10 @@ class LayoutRenderer:
     def _init_menus(self):
         rect = self.layout_def["position"]
         self.menu = MenuManager(self.stdscr, rect["width"], rect["height"])
+        # Cross-reopen selection memory (keyed by stable layout name)
+        if self.menu_memory is not None:
+            self.menu.memory = self.menu_memory
+            self.menu.memory_key = self.layout_name
 
         self.menu.title = self.layout_def.get("title", "")
         if "top_menus" in self.layout_def:
@@ -395,6 +433,8 @@ class LayoutRenderer:
                     widget = LookupField(y, wx, lookup_w, ldata,
                                          display_field=df, value_field=vf,
                                          list_columns=lcols)
+                    # Remember the lookup target so it can be re-seeded later
+                    widget._lookup_name = field["lookup"]
                     # Store full data backup for CASCADE re-filtering
                     widget._all_lookup_data = list(ldata)
                     # Attach cascade metadata: "source_widget->filter_field"
@@ -734,11 +774,11 @@ class LayoutRenderer:
                 continue
 
             data = self.grid_data.get(ref_id, [])
-            grid_y = placement.get("y", 0) + self._figlet_h
+            grid_y = placement.get("y", 0) + self._banner_h
             grid_x = placement.get("x", 0)
             grid_h = placement.get("height", 10)
-            if self._figlet_h:
-                grid_h = max(4, grid_h - self._figlet_h)
+            if self._banner_h:
+                grid_h = max(4, grid_h - self._banner_h)
 
             if HAS_CXGRID:
                 columns = []
@@ -944,6 +984,9 @@ class LayoutRenderer:
                                   max_height=tab_h,
                                   max_width=tgw)
                     grid._grid_id = grid_id
+                    # Detail body fields: allow typing part name / description
+                    # even when the DSL column is marked `ro`.
+                    grid.allow_editing_columns({"part_name", "description"})
                     grid.lookup_handler = self._make_lookup_handler()
                     grid.on_cell_edit = self._make_cell_edit_callback(grid)
                     grid.on_need_new_row = self._make_new_row_callback(grid)
@@ -991,6 +1034,66 @@ class LayoutRenderer:
                         if not c.get("hidden")
                     ]
 
+    def _flash(self, message: str, seconds: float = 3.0):
+        """Show a transient message in the hotkey bar's info slot.
+
+        Needed because embedded detail grids draw no status bar of their own,
+        so a silent F4 (no lookup / no data) looked like a dead key.
+        """
+        self._flash_msg = str(message or "")
+        self._flash_until = time.monotonic() + seconds
+
+    def _refresh_lookup_data(self, lookup_name: str) -> list:
+        """Reload lookup tables (throttled) and return the rows for one name.
+
+        Lookup tables are cached once at startup; if that first read failed
+        (remote DB not ready, table created later) every F4 for the rest of
+        the session used to come back empty. This retries on demand.
+        """
+        if not lookup_name or not self.lookup_loader:
+            return list(self.lookup_data.get(lookup_name, []) or [])
+        now = time.monotonic()
+        if now - self._lookup_reload_at < 5.0:
+            return list(self.lookup_data.get(lookup_name, []) or [])
+        self._lookup_reload_at = now
+        try:
+            fresh = self.lookup_loader()
+        except Exception:
+            return []
+        if isinstance(fresh, dict) and fresh:
+            if isinstance(self.lookup_data, dict):
+                self.lookup_data.clear()
+                self.lookup_data.update(fresh)
+            else:
+                self.lookup_data = fresh
+        return list(self.lookup_data.get(lookup_name, []) or [])
+
+    def _refresh_lookup_widget(self, widget) -> bool:
+        """Re-seed an empty LookupField from the DB, re-applying its filter."""
+        name = getattr(widget, "_lookup_name", "")
+        if not name:
+            return False
+        fresh = self._refresh_lookup_data(name)
+        if not fresh:
+            return False
+        field_def = None
+        for fields in self.form_defs.values():
+            if not isinstance(fields, list):
+                continue
+            for f in fields:
+                if f.get("id") == getattr(widget, "_field_id", ""):
+                    field_def = f
+                    break
+            if field_def:
+                break
+        if field_def and field_def.get("lookup_filter"):
+            flt = field_def["lookup_filter"]
+            fresh = [r for r in fresh
+                     if all(str(r.get(k, "")) == v for k, v in flt.items())]
+        widget.lookup_data = fresh
+        widget._all_lookup_data = list(fresh)
+        return True
+
     def _make_lookup_handler(self):
         """Create a lookup_handler function compatible with cxgrid.
 
@@ -1037,6 +1140,12 @@ class LayoutRenderer:
 
         def handler(lookup_name, val, list_all=False, full_record=False):
             items = lookup_data.get(lookup_name, [])
+            if not items and list_all:
+                # Cached lookup was empty (first load failed or table was
+                # created later) — try the DB again before opening the picker.
+                # Only on demand: decorate_lookup() also calls this on every
+                # repaint and must stay free of DB round-trips.
+                items = self._refresh_lookup_data(lookup_name)
             if list_all:
                 if full_record:
                     # Return full record dicts for multi-column picker
@@ -1332,32 +1441,119 @@ class LayoutRenderer:
         grid.row_attr_fn = _row_highlight
 
     def _filter_pending_delivery(self, ldata: list, src_detail: str,
-                                    link_field: str) -> list:
+                                 link_field: str) -> list:
         """Filter lookup records to those with pending delivery.
 
-        Checks source detail rows (e.g. po_line, pk_line): if any line has
-        qty > fulfilled, the parent has pending delivery.
-        For pk_line: any row with pick_qty > 0 means pending.
+        Fulfillment per (link value, part) is computed from ground truth:
+        the actual receipt/delivery lines of this document type (grn_line,
+        do_line, ...) matched through their parent headers.  The
+        denormalized received_qty / ship_qty counters on the source lines
+        are only written by the posting script, so a document that was
+        saved but never posted (or older data) left the counter at zero
+        and the source document showed as pending forever.
+        """
+        fulfill_map, src_key = self._fulfillment_map_for_copydetail(link_field)
+        import json as _json
+        lv_by_rid = {}
+        for r in ldata:
+            if r.get("rowid") is not None:
+                lv_by_rid[r.get("rowid")] = str(r.get(link_field, "") or "")
+        open_parents = set()
+        drows = self.db.query('SELECT data FROM "%s"' % src_detail)
+        for dr in drows:
+            try:
+                doc = _json.loads(dr.get("data", "{}"))
+                pid = doc.get("_parent_rowid")
+                if pid is None:
+                    continue
+                # Detect qty field: order_qty or pick_qty
+                oq = float(doc.get("order_qty", 0) or 0)
+                if oq <= 0:
+                    oq = float(doc.get("pick_qty", 0) or 0)
+                rq = float(doc.get("received_qty", 0) or 0)
+                sq = float(doc.get("ship_qty", 0) or 0)
+                fulfilled = max(rq, sq)
+                # Ground-truth override: actual target lines count even
+                # when the post-script counter was never written.
+                lv = lv_by_rid.get(pid)
+                if lv and fulfill_map:
+                    gt = fulfill_map.get((lv, str(doc.get(src_key, ""))), 0.0)
+                    if gt > fulfilled:
+                        fulfilled = gt
+                if oq > fulfilled + 1e-9:
+                    open_parents.add(pid)
+            except (ValueError, TypeError):
+                continue
+        return [r for r in ldata if r.get("rowid") in open_parents]
+
+    def _fulfillment_map_for_copydetail(self, link_field: str):
+        """Ground-truth fulfilled qty per (link value, part key), summed
+        from this layout's own detail table (grn_line / do_line / ...).
+
+        Returns (fulfill_map, key_field).
         """
         import json as _json
-        # Build set of parent rowids that have open lines
-        open_parents = set()
-        drows = self.db.query(f'SELECT data FROM "{src_detail}"')
-        for dr in drows:
-            doc = _json.loads(dr.get("data", "{}"))
-            pid = doc.get("_parent_rowid")
-            if pid is None:
-                continue
-            # Detect qty field: order_qty or pick_qty
-            oq = float(doc.get("order_qty", 0) or 0)
-            if oq <= 0:
-                oq = float(doc.get("pick_qty", 0) or 0)
-            rq = float(doc.get("received_qty", 0) or 0)
-            sq = float(doc.get("ship_qty", 0) or 0)
-            fulfilled = max(rq, sq)
-            if oq > fulfilled + 1e-9:
-                open_parents.add(pid)
-        return [r for r in ldata if r.get("rowid") in open_parents]
+        fulfill_map = {}
+        key_field = None
+        try:
+            tabs = self.layout_def.get("tabs") or {}
+            items = tabs.get("items") or []
+            grid_id = items[0].get("grid", "") if items else ""
+            if not grid_id.endswith("_grid"):
+                return fulfill_map, key_field
+            target_table = grid_id[:-5]
+            cols = self.grid_defs.get(grid_id, {}).get("columns", [])
+            col_ids = [c.get("id", "") for c in cols]
+            for cand in ("part_no", "item_code", "product_code"):
+                if cand in col_ids:
+                    key_field = cand
+                    break
+            fulfill_field = None
+            for cand in ("received_qty", "ship_qty", "delivered_qty"):
+                if cand in col_ids:
+                    fulfill_field = cand
+                    break
+            parent_form_id = None
+            for ref_id in self.layout_def.get("fields", {}):
+                if ref_id in self.form_defs:
+                    parent_form_id = ref_id
+                    break
+            if not parent_form_id:
+                return fulfill_map, key_field
+            if parent_form_id.endswith("_form"):
+                parent_table = parent_form_id[:-5]
+            else:
+                parent_table = parent_form_id
+            if not (self.db and target_table and key_field
+                    and fulfill_field and parent_table):
+                return fulfill_map, key_field
+            lv_by_parent = {}
+            parents = self.db.query('SELECT rowid, data FROM "%s"'
+                                    % parent_table)
+            for pr in parents:
+                try:
+                    pd = _json.loads(pr.get("data", "{}"))
+                    lv = pd.get(link_field)
+                    if lv:
+                        lv_by_parent[pr.get("rowid")] = str(lv)
+                except (ValueError, TypeError):
+                    continue
+            details = self.db.query('SELECT data FROM "%s"' % target_table)
+            for dr in details:
+                try:
+                    dd = _json.loads(dr.get("data", "{}"))
+                    lv = lv_by_parent.get(dd.get("_parent_rowid"))
+                    if not lv:
+                        continue
+                    k = (lv, str(dd.get(key_field, "")))
+                    q = float(str(dd.get(fulfill_field, 0) or 0)
+                              .replace(",", "") or 0)
+                except (ValueError, TypeError):
+                    continue
+                fulfill_map[k] = fulfill_map.get(k, 0.0) + q
+        except Exception:
+            fulfill_map = {}
+        return fulfill_map, key_field
 
     def _make_new_row_callback(self, grid):
         """Create on_need_new_row callback that adds a blank row with defaults."""
@@ -1521,24 +1717,49 @@ class LayoutRenderer:
                                             parent_rids.append(pr["rowid"])
                                     except (json.JSONDecodeError, TypeError):
                                         pass
-                                # Sum fulfilled qty from target detail
+                                # Sum fulfilled qty from target detail.
+                                # The fulfillment rows live in this layout's
+                                # DETAIL table (grn_line, do_line, ...), not
+                                # in the parent header table the grid def
+                                # points at — try the likely detail names
+                                # first and fall back to the header table
+                                # for layouts that keep detail rows there.
                                 if parent_rids:
-                                    det_rows = self.db.query(
-                                        f'SELECT data FROM "{target_table}"')
-                                    for dr in det_rows:
+                                    base = (target_grid_id[:-5] if
+                                            target_grid_id.endswith("_grid")
+                                            else target_table)
+                                    candidates = []
+                                    for cand in (base + "_line", base,
+                                                 target_table + "_line",
+                                                 target_table):
+                                        if cand and cand not in candidates:
+                                            candidates.append(cand)
+                                    matched_rows = []
+                                    for cand in candidates:
                                         try:
-                                            dd = json.loads(dr.get("data", "{}"))
-                                            if dd.get("_parent_rowid") in parent_rids:
-                                                pk = str(dd.get(key_field, ""))
-                                                fv = _base_qty(
-                                                    dd.get(fulfill_field, 0),
-                                                    dd.get('uom'),
-                                                    dd.get('pack_uom'),
-                                                    dd.get('pack_qty'),
-                                                )
-                                                fulfilled[pk] = fulfilled.get(pk, 0) + fv
-                                        except (json.JSONDecodeError, TypeError, ValueError):
-                                            pass
+                                            cand_rows = self.db.query(
+                                                f'SELECT data FROM "{cand}"')
+                                        except Exception:
+                                            continue
+                                        matched_rows = []
+                                        for dr in cand_rows:
+                                            try:
+                                                dd = json.loads(dr.get("data", "{}"))
+                                                if dd.get("_parent_rowid") in parent_rids:
+                                                    matched_rows.append(dd)
+                                            except (json.JSONDecodeError, TypeError):
+                                                pass
+                                        if matched_rows:
+                                            break
+                                    for dd in matched_rows:
+                                        pk = str(dd.get(key_field, ""))
+                                        fv = _base_qty(
+                                            dd.get(fulfill_field, 0),
+                                            dd.get('uom'),
+                                            dd.get('pack_uom'),
+                                            dd.get('pack_qty'),
+                                        )
+                                        fulfilled[pk] = fulfilled.get(pk, 0) + fv
                         except Exception:
                             pass
 
@@ -1563,47 +1784,98 @@ class LayoutRenderer:
                 break
 
         # Rollup: if source has multiple rows per key (e.g. pk_line with
-        # per-lot rows), aggregate qty by part_no before building DO lines
+        # per-lot rows), aggregate qty by part_no before building DO lines.
+        # Rows with an EMPTY key (part_name continuation/text lines typed
+        # below a real line) are never duplicates of each other — they must
+        # not trigger rollup and must survive the pull in their original
+        # order, or pulling a PO loses its last rows.
+        #
+        # Only business-identical duplicates may merge (they differ only in
+        # lot/storage fields, which are dropped on copy).  Source lines that
+        # differ in a copied business field — e.g. a PO with the same part
+        # at two unit_cost values — are economically distinct and must be
+        # brought in as-is, one target line per source line.
+        _rollup_skip = {"_parent_rowid", "lot_no", "grn_no", "loc_id",
+                        "storage_rowid", "_storage_rowid"}
+        if qty_field:
+            _rollup_skip.add(qty_field)
+
+        def _fp_val(v):
+            if isinstance(v, bool):
+                return str(v)
+            if isinstance(v, (int, float)):
+                return "%g" % v
+            return str(v)
+
+        def _biz_fp(row):
+            return sorted((k, _fp_val(v)) for k, v in row.items()
+                          if k not in _rollup_skip)
+
         needs_rollup = False
         if key_field_src and qty_field and source_rows:
-            seen_keys = set()
+            seen_fps = {}  # key -> fingerprint of first row with that key
             for src in source_rows:
                 pk = str(src.get(key_field_src, ""))
-                if pk in seen_keys:
+                if not pk:
+                    continue
+                fp = _biz_fp(src)
+                if pk in seen_fps:
+                    if seen_fps[pk] != fp:
+                        # Duplicates differ in business fields (price, uom,
+                        # ...) — distinct lines, never merge.
+                        needs_rollup = False
+                        break
                     needs_rollup = True
-                    break
-                seen_keys.add(pk)
+                else:
+                    seen_fps[pk] = fp
 
         if needs_rollup:
-            # Aggregate by key field — sum qty, keep first row's other fields
-            rollup = {}  # key -> merged row
+            # Aggregate by key field — sum qty, keep first row's other
+            # fields.  Empty-key rows pass through untouched, in place.
+            rollup = {}  # key -> index into merged_rows
+            merged_rows = []
             for src in source_rows:
                 pk = str(src.get(key_field_src, ""))
+                if not pk:
+                    merged_rows.append({k: v for k, v in src.items()
+                                        if k != "_parent_rowid"})
+                    continue
                 q = float(src.get(qty_field, 0) or 0)
                 if pk in rollup:
-                    rollup[pk][qty_field] = float(rollup[pk].get(qty_field, 0) or 0) + q
+                    tgt = merged_rows[rollup[pk]]
+                    tgt[qty_field] = float(tgt.get(qty_field, 0) or 0) + q
                 else:
                     row_copy = {k: v for k, v in src.items()
                                 if k != "_parent_rowid"
                                 and k not in ("lot_no", "grn_no", "loc_id",
                                               "storage_rowid", "_storage_rowid")}
                     row_copy[qty_field] = q
-                    rollup[pk] = row_copy
-            source_rows = list(rollup.values())
+                    rollup[pk] = len(merged_rows)
+                    merged_rows.append(row_copy)
+            source_rows = merged_rows
 
+        remaining_fulfill = {}  # key -> fulfilled qty not yet consumed
         for src in source_rows:
             oq_raw = float(src.get("order_qty", 0) or 0)
             # Fallback: use pick_qty or other qty field as order_qty equivalent
             if oq_raw <= 0 and qty_field and qty_field != "order_qty":
                 oq_raw = float(src.get(qty_field, 0) or 0)
             pk = str(src.get(key_field_src, "")) if key_field_src else ""
-            already = fulfilled.get(pk, 0)
             oq_base = _base_qty(
                 oq_raw,
                 src.get('uom'),
                 src.get('pack_uom'),
                 src.get('pack_qty'),
             )
+            already = 0.0
+            if pk and pk in fulfilled:
+                # Distribute the per-key fulfilled total sequentially across
+                # same-key rows (row order = source line order); subtracting
+                # the whole total from every row would over-subtract parts
+                # ordered on more than one line.
+                rem = remaining_fulfill.get(pk, fulfilled[pk])
+                already = min(max(rem, 0.0), max(oq_base, 0.0))
+                remaining_fulfill[pk] = rem - already
             balance_base = oq_base - already
             if balance_base > 1e-9:
                 row_copy = dict(src)
@@ -1619,8 +1891,10 @@ class LayoutRenderer:
                     if ff in row_copy:
                         row_copy[ff] = balance
                 open_rows.append(row_copy)
-            elif oq_base <= 0 and not already:
-                # No order_qty — copy as-is
+            elif oq_base <= 0:
+                # No order_qty — copy as-is.  Continuation/text rows and
+                # zero-qty lines must survive every pull (the old
+                # "and not already" guard silently dropped them on re-pulls).
                 open_rows.append(dict(src))
         if not open_rows:
             return
@@ -1738,56 +2012,29 @@ class LayoutRenderer:
         has_form = bool(self.widgets)
         return has_grid and not has_form
 
-    def _calc_figlet_height(self):
-        """Calculate figlet banner height for listing pages."""
-        try:
-            import pyfiglet
-        except ImportError:
-            return 0
+    def _make_banner(self):
+        """Create the big-text title banner for listing pages.
+
+        Returns a BigTitleBanner with height 0 (no banner) when the layout
+        is not a plain listing page or pytitle is unavailable.
+        """
         # Only for listing layouts (grid-only, no menus/tabs/forms)
         if self.layout_def.get("center_menu") or self.layout_def.get("top_menus"):
-            return 0
+            return BigTitleBanner(self.stdscr, "")
         if self.layout_def.get("tabs"):
-            return 0
+            return BigTitleBanner(self.stdscr, "")
         # Check fields reference grids, not forms
         fields = self.layout_def.get("fields", {})
         has_grid_field = any(fid in self.grid_defs for fid in fields)
         has_form_field = any(fid in self.form_defs for fid in fields)
         if not has_grid_field or has_form_field:
-            return 0
+            return BigTitleBanner(self.stdscr, "")
         title = self.layout_def.get("title", "")
-        if not title:
-            return 0
-        h, w = self.stdscr.getmaxyx()
-        try:
-            fig = pyfiglet.figlet_format(title, font="standard", width=w - 4)
-        except Exception:
-            return 0
-        lines = [ln for ln in fig.rstrip("\n").split("\n") if ln.strip()]
-        return min(len(lines), h // 4)
+        return BigTitleBanner(self.stdscr, title)
 
-    def _draw_figlet(self):
-        """Render figlet title banner at top of listing pages."""
-        if not self._figlet_h:
-            return
-        try:
-            import pyfiglet
-        except ImportError:
-            return
-        h, w = self.stdscr.getmaxyx()
-        title = self.layout_def.get("title", "")
-        try:
-            fig = pyfiglet.figlet_format(title, font="standard", width=w - 4)
-        except Exception:
-            return
-        lines = [ln for ln in fig.rstrip("\n").split("\n") if ln.strip()]
-        attr = curses.color_pair(CLR_FORM_BORDER) | curses.A_BOLD
-        for i in range(min(len(lines), self._figlet_h)):
-            cx = max(0, (w - len(lines[i])) // 2)
-            try:
-                self.stdscr.addstr(i, cx, lines[i][:w - 1], attr)
-            except curses.error:
-                pass
+    def _draw_banner(self):
+        """Render the big-text title banner at top of listing pages."""
+        self._banner.draw(0)
 
     def _get_effective_rect(self):
         """Return layout rectangle, expanded to terminal size."""
@@ -1801,10 +2048,10 @@ class LayoutRenderer:
     def _draw_frame(self):
         rect = self._get_effective_rect()
         border_attr = curses.color_pair(CLR_FORM_BORDER)
-        # Figlet banner on listing pages
-        if self._figlet_h:
-            self._draw_figlet()
-        frame_y = rect["y"] + self._figlet_h
+        # Big-text banner on listing pages
+        if self._banner_h:
+            self._draw_banner()
+        frame_y = rect["y"] + self._banner_h
         if self.layout_def.get("border", 0):
             try:
                 self.stdscr.attron(border_attr)
@@ -1815,7 +2062,7 @@ class LayoutRenderer:
                 pass
         title = self.layout_def.get("title", "")
         if title and "top_menu" not in self.layout_def:
-            if not self._figlet_h:
+            if not self._banner_h:
                 try:
                     self.stdscr.addstr(frame_y, rect["x"] + 2, f" {title} ",
                                        curses.A_BOLD | border_attr)
@@ -1962,10 +2209,11 @@ class LayoutRenderer:
             info = f"Editing{rowid}" if rowid else ""
             if self.layout_def.get("crud_tabs"):
                 info = (info + "  " if info else "") + "PgUp: List"
-            self.status_line.set_info(info)
         else:
             info = "PgUp: List" if self.layout_def.get("crud_tabs") else ""
-            self.status_line.set_info(info)
+        if self._flash_msg and time.monotonic() < self._flash_until:
+            info = self._flash_msg
+        self.status_line.set_info(info)
 
         self.status_line.draw()
 
@@ -2011,6 +2259,115 @@ class LayoutRenderer:
     def _set_focus(self, idx: int):
         for i, w in enumerate(self.widgets):
             w.focused = (i == idx)
+
+    def _thai_popup_edit(self, focus_idx, on_tabs):
+        """Alt-L — type Thai for the focused field or grid cell into a
+        Thai-capable overlay window, stored as a SIDE MEMO linked to the DB
+        record (thai_memo table keyed table:rowid:field). The visible field
+        value is never touched: screens show the English part as-is and the
+        memo is used only when printing (form_pdf draws it under/next to the
+        English value).
+
+        Memo identity:
+        - header field: table:header_rowid:field_id
+        - grid cell:    detail_table:line_rowid:column  (line rowid from the
+          row data; falls back to the line index for unsaved lines)
+
+        For a brand-new record (no rowid yet) the memo is held in memory for
+        this screen session (printing works immediately) and mirrored to the
+        JSON side file; re-Alt-L after the record is saved to persist it.
+        """
+        value = None
+        label = ""
+        grid = None
+        col = None
+        row_data = None
+        table = str(self.layout_def.get("table", "")
+                    or self.layout_def.get("id", "")
+                    or self.layout_def.get("title", "") or "form")
+        if table.endswith("_form"):
+            table = table[:-5]
+
+        header_rid = None
+        if self.edit_context:
+            header_rid = self.edit_context.get("rowid")
+
+        if on_tabs and 0 <= self.active_tab < len(self.tab_grids):
+            grid = self.tab_grids[self.active_tab]
+            if grid and HAS_CXGRID and isinstance(grid, CxGrid):
+                col = (grid.columns[grid.col]
+                       if 0 <= grid.col < len(grid.columns) else None)
+                row_data = grid._view_row(grid.row)
+                if col is None or row_data is None:
+                    if self.status_line:
+                        self.status_line.set_info("Alt-L: no cell selected")
+                    return
+                gid = str(getattr(grid, "_grid_id", "") or "")
+                if gid.endswith("_grid"):
+                    gid = gid[:-5]
+                table = gid or table
+                rid = row_data.get("rowid") or row_data.get("_rowid")
+                if rid is None:
+                    try:
+                        rid = f"line{grid._data_index(grid.row)}"
+                    except Exception:
+                        rid = "new"
+                field = col.store_field if col.lookup else col.name
+                label = col.label or col.name
+            else:
+                if self.status_line:
+                    self.status_line.set_info("Alt-L: no editable grid here")
+                return
+        elif focus_idx < len(self.widgets):
+            w = self.widgets[focus_idx]
+            rid = header_rid if header_rid is not None else "new"
+            field = (getattr(w, "field_id", "")
+                     or getattr(w, "_field_id", "")
+                     or f"idx{focus_idx}")
+            label = getattr(w, "_label", "") or getattr(w, "label", "") or field
+        else:
+            if self.status_line:
+                self.status_line.set_info("Alt-L: cursor is not on a field")
+            return
+
+        from . import thai_memo as _tm
+        key = _tm.memo_key(table, rid, field)
+
+        # Preload: existing memo; else any Thai already inside the field
+        # value (legacy values typed before the memo store existed)
+        value = _tm.get_thai(self.db, table, rid, field)
+        if not value:
+            if grid is not None and col is not None and row_data is not None:
+                current = str(grid._field_value(col, row_data) or "")
+            elif focus_idx < len(self.widgets):
+                current = str(self.widgets[focus_idx].value or "")
+            else:
+                current = ""
+            if _has_thai(current):
+                value = current
+        multiline = len(value) > 40
+        form_name = str(self.layout_def.get("form", "")
+                        or self.layout_def.get("id", "")
+                        or self.layout_def.get("title", "") or "")
+
+        from .thai_popup import popup_edit
+        try:
+            new_value = popup_edit(self.stdscr, label, value,
+                                   multiline=multiline, form_name=form_name)
+        except Exception as e:
+            if self.status_line:
+                self.status_line.set_info(f"Alt-L error: {e}")
+            return
+
+        if new_value is None or new_value == value:
+            return  # cancelled or unchanged
+
+        stored_db = _tm.set_thai(self.db, table, rid, field, new_value)
+        self._thai_memos[key] = new_value  # in-session print cache
+        where = "DB" if stored_db else "session (save record to persist)"
+        if self.status_line:
+            self.status_line.set_info(
+                f"Alt-L: Thai memo saved for '{label}' — print only ({where})")
 
     def _export_form_pdf(self):
         """Export current form to PDF via Ctrl+P."""
@@ -2075,6 +2432,43 @@ class LayoutRenderer:
 
         computed_defs = self.layout_def.get("computed")
 
+        # ── Thai memos for this record (print-only side data) ──
+        thai_header = {}
+        thai_lines = {}
+        try:
+            from . import thai_memo as _tm
+            ptable = str(self.layout_def.get("table", "")
+                         or self.layout_def.get("id", "") or "")
+            if ptable.endswith("_form"):
+                ptable = ptable[:-5]
+            rid = self.edit_context.get("rowid") if self.edit_context else None
+            rid_str = str(rid) if rid is not None else "new"
+
+            all_memos = dict(self._thai_memos)
+            all_memos.update(_tm.get_all(self.db))  # DB is authoritative
+
+            # Detail-line rowids in this print batch
+            line_rowids = set()
+            for dg in detail_grids:
+                for row in dg.get("data", []):
+                    rv = row.get("rowid") or row.get("_rowid")
+                    if rv is not None:
+                        line_rowids.add(str(rv))
+
+            for k, text in all_memos.items():
+                if not text:
+                    continue
+                parts = k.split(":", 2)
+                if len(parts) != 3:
+                    continue
+                t, r, f = parts
+                if t == ptable and r == rid_str:
+                    thai_header[f] = text          # header field memo
+                elif str(r) in line_rowids:
+                    thai_lines[f"{r}:{f}"] = text  # detail cell memo
+        except Exception:
+            thai_header, thai_lines = {}, {}
+
         # Find form fields from form_defs
         form_fields = []
         header_form = self.layout_def.get("header_form", "")
@@ -2088,7 +2482,8 @@ class LayoutRenderer:
 
         result = export_form_pdf(
             form_fields, record, detail_grids, settings, title,
-            computed_defs=computed_defs, landscape=landscape)
+            computed_defs=computed_defs, landscape=landscape,
+            thai_header=thai_header, thai_lines=thai_lines)
 
         # Restore curses state after PDF generation
         self.stdscr.touchwin()
@@ -2382,6 +2777,14 @@ class LayoutRenderer:
                         if ag and HAS_CXGRID and isinstance(ag, CxGrid):
                             ag._open_column_config()
                             self._save_column_config(ag)
+                elif next_key in (ord('l'), ord('L')):
+                    # Alt-L fallback — Thai popup edit on field/cell
+                    try:
+                        self._thai_popup_edit(focus_idx, on_tabs)
+                    except Exception as e:
+                        if self.status_line:
+                            self.status_line.set_info(f"Alt-L error: {e}")
+                    continue
                 else:
                     # Other escape sequence — ignore
                     continue
@@ -2391,6 +2794,16 @@ class LayoutRenderer:
                     if ag and HAS_CXGRID and isinstance(ag, CxGrid):
                         ag._open_column_config()
                         self._save_column_config(ag)
+                continue
+            elif key == getattr(curses, "ALT_L", 428):
+                # Alt-L — Thai popup edit on the focused field or grid cell
+                # (Thai cannot be placed safely inside the curses grid; the
+                # full-screen text editor subprocess handles input)
+                try:
+                    self._thai_popup_edit(focus_idx, on_tabs)
+                except Exception as e:
+                    if self.status_line:
+                        self.status_line.set_info(f"Alt-L error: {e}")
                 continue
             elif key == curses.KEY_F6:  # F6 cycle header/detail/UDF focus
                 if self.layout_def.get("crud_tabs") and not self.tabs_def:
@@ -2436,18 +2849,38 @@ class LayoutRenderer:
                     if 0 <= self.active_tab < len(self.tab_grids):
                         ag = self.tab_grids[self.active_tab]
                         if ag and HAS_CXGRID and isinstance(ag, CxGrid):
-                            ag.handle_input(key)
-                            if ag.save_requested:
-                                ag.save_requested = False
-                                self._hide_cursor()
-                                return "__save__"
+                            col = (ag.columns[ag.col]
+                                   if 0 <= ag.col < len(ag.columns) else None)
+                            if col is None:
+                                self._flash("F4: no cell selected")
+                            elif not col.lookup:
+                                # Embedded grids have no status bar of their
+                                # own — say why nothing happened.
+                                self._flash(f"F4: column '{col.label}' has no lookup")
+                            else:
+                                ag.handle_input(key)
+                                msg = ag.get_status()
+                                if msg:
+                                    self._flash(msg)
+                                if ag.save_requested:
+                                    ag.save_requested = False
+                                    self._hide_cursor()
+                                    return "__save__"
+                                # Recompute header after lookup fill may have
+                                # changed detail values (amount, subtotal, etc.)
+                                if self._computed_defs:
+                                    self._recompute_header()
                 elif focus_idx < len(self.widgets):
                     w = self.widgets[focus_idx]
                     if isinstance(w, LookupField):
                         old_val = w.value
+                        if not w.lookup_data:
+                            self._refresh_lookup_widget(w)
                         w.handle_key(curses.KEY_F4)
                         if w.value != old_val:
                             self._auto_fill_lookup(w)
+                    else:
+                        self._flash(f"F4: '{getattr(w, '_label', '')}' has no lookup")
             elif on_tabs:
                 # Tab bar is focused — pass keys to active tab grid for editing
                 active_grid = None
@@ -2472,8 +2905,8 @@ class LayoutRenderer:
                         self.active_tab = (self.active_tab + 1) % num_tabs
                     else:
                         focus_idx = (focus_idx + 1) % total_items
-                elif key in (curses.KEY_IC, curses.KEY_F3) and active_grid and HAS_CXGRID and isinstance(active_grid, CxGrid):
-                    # Insert or F3 — add blank row seeded with defaults
+                elif key == curses.KEY_F3 and active_grid and HAS_CXGRID and isinstance(active_grid, CxGrid):
+                    # F3 — append a blank row seeded with defaults
                     new_row = {}
                     for c in active_grid.columns:
                         if c.numeric:
@@ -2481,6 +2914,12 @@ class LayoutRenderer:
                         else:
                             new_row[c.name] = ""
                     active_grid.add_row(new_row)
+                    self._recompute_header()
+                elif key in (curses.KEY_IC, 477) and active_grid and HAS_CXGRID and isinstance(active_grid, CxGrid):
+                    # Insert / Ctrl+Insert (477 = windows-curses extended
+                    # code) — insert a blank row at the current row
+                    # position (not appended at the end).
+                    active_grid.insert_row_here()
                     self._recompute_header()
                 elif (active_grid and HAS_CXGRID and isinstance(active_grid, CxGrid)
                       and self._handle_grid_uom_shortcut(key, active_grid, grid_editing)):
@@ -2624,7 +3063,7 @@ class LayoutRenderer:
                     views = gdef.get("list_views", [])
                     if views:
                         return "__cycle_view__"
-                elif key == 4:  # Ctrl+D delete
+                elif key in (4, 527, curses.KEY_DC):  # Ctrl+D / Ctrl+Delete / Del
                     if grid.data and grid._view_indices:
                         row = grid._view_row(grid.row)
                         if row and row.get("rowid") is not None:

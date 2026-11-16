@@ -112,7 +112,7 @@ FORM grn TITLE "Goods Receipt" COLS 2
       IF po_number
         UPDATE item SET on_order = item.on_order - _grn_qty WHERE _rowid = item._rowid
         FETCH po_rec FROM po WHERE po_number = po_number
-        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND _parent_rowid = po_rec._rowid
+        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND unit_cost = line.unit_cost AND _parent_rowid = po_rec._rowid
         UPDATE po_line SET received_qty = po_ln.received_qty + line.received_qty WHERE _rowid = po_ln._rowid
       END
     END
@@ -129,7 +129,7 @@ FORM grn TITLE "Goods Receipt" COLS 2
       IF po_number
         UPDATE item SET on_order = item.on_order + _grn_qty WHERE _rowid = item._rowid
         FETCH po_rec FROM po WHERE po_number = po_number
-        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND _parent_rowid = po_rec._rowid
+        FETCH po_ln FROM po_line WHERE part_no = line.part_no AND unit_cost = line.unit_cost AND _parent_rowid = po_rec._rowid
         UPDATE po_line SET received_qty = po_ln.received_qty - line.received_qty WHERE _rowid = po_ln._rowid
       END
     END

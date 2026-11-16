@@ -41,7 +41,7 @@ _KEYWORDS = {
     'BOMEXPLODE', 'BOMROLLUP', 'FIFOOUT', 'COUNTROWS', 'NEXTDOCNO',
     'BASEQTY', 'DISPLAYQTY',
     'PUTAWAY_ALLOCATE', 'PICKING_ALLOCATE', 'PICKING_CONFIRM',
-    'SETTING',
+    'CARDBALANCE', 'SETTING',
 }
 
 def tokenize(line: str) -> List[str]:
@@ -1402,6 +1402,11 @@ class ScriptExecutor:
             wh_id = str(vals[0] or '').strip()
             pick_lines = vals[1] if isinstance(vals[1], list) else []
             return self._picking_confirm(wh_id, pick_lines)
+        elif name == 'CARDBALANCE':
+            # CARDBALANCE(part_no) — last running balance from item_card
+            if not vals:
+                return 0
+            return self._card_balance(str(vals[0] or '').strip())
 
         # ── Math (new) ──
         elif name == 'CEIL':
@@ -1856,6 +1861,12 @@ class ScriptExecutor:
         # Load warehouse config
         wh_rows, wh_cols, wh_levels = 8, 10, 1
         default_cbm = 150.0
+        # Import ConnectionLost so we don't swallow transport failures
+        try:
+            from dsl_lib.adapters import ConnectionLost as _ConnLost
+        except ImportError:
+            _ConnLost = type(None)
+
         try:
             rows = self.db.query('SELECT data FROM "warehouse"')
             for row in rows:
@@ -1867,6 +1878,8 @@ class ScriptExecutor:
                     default_cbm = self._to_num(doc.get("default_cbm", 150.0)) or 150.0
                     break
         except Exception as e:
+            if isinstance(e, _ConnLost):
+                raise
             self._log_err(e, "PUTAWAY_ALLOCATE warehouse lookup")
 
         # Load existing wh_locations
@@ -1880,6 +1893,8 @@ class ScriptExecutor:
                 if loc_key and doc.get("warehouse") == wh_id:
                     db_loc_map[loc_key] = doc
         except Exception as e:
+            if isinstance(e, _ConnLost):
+                raise
             self._log_err(e, "PUTAWAY_ALLOCATE wh_locations load")
 
         # Generate full location grid
@@ -1952,6 +1967,8 @@ class ScriptExecutor:
                 if pn:
                     item_cbm[pn] = self._to_num(doc.get("cbm", 0.10)) or 0.10
         except Exception as e:
+            if isinstance(e, _ConnLost):
+                raise
             self._log_err(e, "PUTAWAY_ALLOCATE item cbm cache")
 
         # Allocate
@@ -2031,6 +2048,8 @@ class ScriptExecutor:
                         'INSERT INTO "wh_locations" (data) VALUES (?)',
                         (json.dumps(clean),))
             except Exception as e:
+                if isinstance(e, _ConnLost):
+                    raise
                 self._log_err(e, f"PUTAWAY_ALLOCATE upsert {loc_id}")
 
         return pa_lines
@@ -2058,6 +2077,12 @@ class ScriptExecutor:
                     if pn and balance > 0.001:
                         storage_by_part.setdefault(pn, []).append(doc)
         except Exception as e:
+            try:
+                from dsl_lib.adapters import ConnectionLost as _CL
+            except ImportError:
+                _CL = type(None)
+            if isinstance(e, _CL):
+                raise
             self._log_err(e, "PICKING_ALLOCATE storage load")
             return []
 
@@ -2120,6 +2145,12 @@ class ScriptExecutor:
         """Confirm picking: update warehouse_storage and wh_locations."""
         updated = 0
 
+        # Import ConnectionLost so we don't swallow transport failures
+        try:
+            from dsl_lib.adapters import ConnectionLost as _ConnLost
+        except ImportError:
+            _ConnLost = type(None)  # never matches
+
         # Item CBM cache for location CBM reduction
         item_cbm = {}
         try:
@@ -2130,6 +2161,8 @@ class ScriptExecutor:
                 if pn:
                     item_cbm[pn] = self._to_num(doc.get("cbm", 0.10)) or 0.10
         except Exception as e:
+            if isinstance(e, _ConnLost):
+                raise
             self._log_err(e, "PICKING_CONFIRM item cache")
 
         # Pre-load warehouse_storage for fallback lookup
@@ -2141,6 +2174,8 @@ class ScriptExecutor:
                 wd['_rowid'] = wr.get('rowid')
                 storage_cache.append(wd)
         except Exception as e:
+            if isinstance(e, _ConnLost):
+                raise
             self._log_err(e, "PICKING_CONFIRM storage cache")
 
         for pl in pick_lines:
@@ -2191,6 +2226,8 @@ class ScriptExecutor:
                     (json.dumps(doc), storage_rowid))
                 updated += 1
             except Exception as e:
+                if isinstance(e, _ConnLost):
+                    raise
                 self._log_err(e, f"PICKING_CONFIRM storage {part_no}")
                 continue
 
@@ -2215,9 +2252,31 @@ class ScriptExecutor:
                                 (json.dumps(ld), lr["rowid"]))
                             break
                 except Exception as e:
+                    if isinstance(e, _ConnLost):
+                        raise
                     self._log_err(e, f"PICKING_CONFIRM loc {db_key}")
 
         return updated
+
+    def _card_balance(self, part_no: str) -> float:
+        """CARDBALANCE — return the last running balance from item_card for a part."""
+        if not part_no:
+            return 0
+        try:
+            rows = self.db.query('SELECT rowid, data FROM "item_card"')
+            best_rowid = -1
+            best_balance = 0.0
+            for row in rows:
+                doc = json.loads(row.get("data", "{}"))
+                if str(doc.get("part_no", "")) == part_no:
+                    rid = row.get("rowid", 0) or 0
+                    if rid > best_rowid:
+                        best_rowid = rid
+                        best_balance = self._to_num(doc.get("balance", 0))
+            return best_balance
+        except Exception as e:
+            self._log_err(e, f"CARDBALANCE {part_no}")
+            return 0
 
     def _log_err(self, exc, context=""):
         """Log exception to errors.log (best-effort)."""

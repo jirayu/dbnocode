@@ -14,6 +14,8 @@ dbnocode_settings.json
 print_config.json
 udf_schemas.json
 custom_options.json
+thai_popup_side.json
+thai_memo_side.json
 *.dsl.imports.json
 
 # Build artifacts
@@ -42,6 +44,7 @@ CLAUDE.md
 .test_tmp/
 .tmp/
 temp/
+graphify-out/
 
 # Logs
 crash.log

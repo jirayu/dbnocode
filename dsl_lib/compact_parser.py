@@ -41,15 +41,37 @@ QUOTED = r'"([^"]+)"'
 
 
 class DSLParseError(SyntaxError):
-    """Raised when a DSL construct cannot be parsed unambiguously."""
+    """Raised when a DSL construct cannot be parsed unambiguously.
+
+    Carries the 1-based source line number when known so ``main.py`` can show
+    ``file:line`` in parse diagnostics.
+    """
+
+    def __init__(self, msg: str, lineno: int = None, line_text: str = ""):
+        self.line_no = lineno
+        self.line_text = line_text
+        super().__init__(msg)
+
+    def __str__(self):
+        if self.line_no:
+            return f"line {self.line_no}: {self.args[0]}"
+        return str(self.args[0])
 
 
 class CompactDSLParser:
     def __init__(self, text: str):
         self.raw = text
-        self.lines = [re.sub(r'//.*', '', l).rstrip() for l in text.splitlines()]
+        from dsl_lib._text import strip_comments
+        stripped = [strip_comments(l) for l in text.splitlines()]
+        self.line_nos = list(range(1, len(stripped) + 1))
+        self.lines = [l.rstrip() for l in stripped]
         self.pos = 0
+        # 1-based source line of the most recently consumed line
+        self.cur_no = 0
         self.app = {}
+
+    def _err(self, msg: str, line: str = ""):
+        raise DSLParseError(msg, lineno=self.cur_no or None, line_text=line)
 
     def _remember_id(self, ident: str):
         if ident in self.app.get("_all_ids", set()):
@@ -59,6 +81,7 @@ class CompactDSLParser:
     def _next(self, skip_blank=True):
         while self.pos < len(self.lines):
             l = self.lines[self.pos].strip()
+            self.cur_no = self.line_nos[self.pos]
             self.pos += 1
             if skip_blank and l == '':
                 continue
@@ -91,14 +114,19 @@ class CompactDSLParser:
             if re.match(r'^APP\b', up):
                 m = re.fullmatch(rf'APP\s+{QUOTED}\s+VERSION\s+{QUOTED}', line, re.I)
                 if not m:
-                    raise DSLParseError(f"Invalid APP declaration: {line}")
+                    self._err(
+                        "Invalid APP declaration. "
+                        "Expected: APP \"Name\" VERSION \"1.0\"", line)
                 self.app["meta"]["name"] = m.group(1)
                 self.app["meta"]["version"] = m.group(2)
 
             elif re.match(r'^DATASOURCE\b', up):
-                m = re.fullmatch(rf'DATASOURCE\s+{QUOTED}\s+ADAPTER\s+{QUOTED}', line, re.I)
+                m = re.fullmatch(
+                    rf'DATASOURCE\s+{QUOTED}\s+ADAPTER\s+{QUOTED}', line, re.I)
                 if not m:
-                    raise DSLParseError(f"Invalid DATASOURCE declaration: {line}")
+                    self._err(
+                        "Invalid DATASOURCE declaration. "
+                        "Expected: DATASOURCE \"db\" ADAPTER \"sqlite\"", line)
                 self.app["datasource"] = {"name": m.group(1), "adapter": m.group(2).lower()}
 
             elif re.match(r'^FIELDSET\b', up):
@@ -118,14 +146,19 @@ class CompactDSLParser:
 
             elif re.match(r'^RESET\b', up):
                 if up != "RESET":
-                    raise DSLParseError(f"Invalid RESET declaration: {line}")
+                    self._err(
+                        "Invalid RESET declaration — RESET takes no "
+                        "arguments", line)
                 self._parse_reset()
 
             elif re.match(r'^(FORM|MENU|REPORT|SUBROUTINE)\b', up):
                 raise DSLParseError(f"Invalid top-level declaration: {line}")
 
             elif up not in ("---",):
-                raise DSLParseError(f"Unknown top-level declaration: {line}")
+                self._err(
+                    f"Unknown top-level declaration. Expected APP, "
+                    f"DATASOURCE, FORM, GRID, MENU, REPORT, SUBROUTINE, "
+                    f"FIELDSET or RESET", line)
 
         self._inject_system_menu()
         self.app.pop("fieldsets", None)
@@ -207,7 +240,9 @@ class CompactDSLParser:
         """Parse a reusable FIELDSET block for compact forms."""
         m = re.match(r'^FIELDSET\s+(\w+)', header, re.I)
         if not m:
-            raise DSLParseError(f"Invalid FIELDSET declaration: {header}")
+            self._err(
+                "Invalid FIELDSET declaration. "
+                "Expected: FIELDSET name", header)
         name = m.group(1)
         items = []
 
@@ -231,12 +266,14 @@ class CompactDSLParser:
         if up.startswith("SECTION "):
             sm = re.match(rf'^SECTION\s+{QUOTED}', line, re.I)
             if not sm:
-                raise DSLParseError(f"Invalid SECTION in FIELDSET '{fieldset_name}': {line}")
+                self._err(
+                    f"Invalid SECTION in FIELDSET '{fieldset_name}' — "
+                    f"expected: SECTION \"Label\"", line)
             return [{"type": "SECTION", "label": sm.group(1)}]
         if "|" in line:
             field = self._parse_field_line(line)
             return [field] if field else []
-        raise DSLParseError(f"Invalid FIELDSET line in '{fieldset_name}': {line}")
+        self._err(f"Invalid FIELDSET line in '{fieldset_name}': {line}")
 
     def _expand_fieldset_references(self, refs: str, owner: str) -> List[dict]:
         """Expand one or more comma-separated fieldset references."""
@@ -247,8 +284,9 @@ class CompactDSLParser:
                 continue
             source = self.app["fieldsets"].get(name)
             if source is None:
-                raise DSLParseError(
-                    f"FIELDSET '{owner}' references undefined fieldset '{name}'")
+                self._err(
+                    f"FIELDSET '{owner}' references undefined "
+                    f"fieldset '{name}'", refs)
             items.extend(copy.deepcopy(source))
         return items
 
@@ -257,7 +295,9 @@ class CompactDSLParser:
         # FORM name TITLE "Title" COLS 2
         m = re.match(r'^FORM\s+(\w+)', header, re.I)
         if not m:
-            raise DSLParseError(f"Invalid FORM declaration: {header}")
+            self._err(
+                "Invalid FORM declaration — expected: "
+                "FORM <name> [TITLE \"...\"] [COLS n] [ENTRY]", header)
         name = m.group(1)
         form_id = f"{name}_form"
         grid_id = f"{name}_grid"
@@ -379,8 +419,23 @@ class CompactDSLParser:
 
             elif "|" in line:
                 field = self._parse_field_line(line)
-                if field:
-                    fields.append(field)
+                if not field:
+                    self._err(
+                        f"Malformed field line inside FORM '{name}' — "
+                        f"expected: id | width | flags", line)
+                fields.append(field)
+            elif up.startswith("END ") or up in ("ENDSCRIPT", "ENDSUBROUTINE"):
+                self._err(
+                    f"'{line}' inside FORM '{name}' — compact blocks close "
+                    f"with a plain END (no suffix before it). Did you mean "
+                    f"just 'END'?", line)
+            else:
+                self._err(
+                    f"Unrecognized line inside FORM '{name}'. Expected a "
+                    f"field (id | width | flags), SECTION, DETAIL, "
+                    f"TREE_DETAIL, LIST, LISTVIEW, COMPUTED, HIGHLIGHT, "
+                    f"UDF, USE <fieldset>, ON SAVE, POSTING, WORKFLOW or "
+                    f"SCRIPT", line)
         self._next()  # consume END
 
         # ── Generate form ──
@@ -412,7 +467,7 @@ class CompactDSLParser:
             # Auto-generate grid from all non-section fields
             grid_columns = []
             for f in fields:
-                if f.get("type") == "SECTION":
+                if f.get("type") in ("SECTION", "SPACER"):
                     continue
                 col = {"id": f["id"], "type": f.get("type", "STRING"),
                        "width": min(f.get("length", 12), 20)}
@@ -1122,7 +1177,9 @@ class CompactDSLParser:
         """
         tm = re.match(rf'^MENU\s+{QUOTED}\s*(PULLDOWN|MAINMENU)?', header, re.I)
         if not tm:
-            raise DSLParseError(f"Invalid MENU declaration: {header}")
+            self._err(
+                "Invalid MENU declaration — expected: "
+                "MENU \"Title\" [PULLDOWN]", header)
         menu_title = tm.group(1)
         menu_type = (tm.group(2) or "MAINMENU").upper() if tm else "MAINMENU"
 
@@ -1155,6 +1212,11 @@ class CompactDSLParser:
                     if item:
                         center_items.append(item)
                 self._next()  # consume END
+
+            else:
+                self._err(
+                    f"Unrecognized line inside MENU. Expected PULLDOWN "
+                    f"\"Label\", GROUP \"Label\" or CENTER", line)
 
         self._next()  # consume final END
 
@@ -1193,7 +1255,8 @@ class CompactDSLParser:
         """Parse: "Label" => target [HOTKEY key]"""
         m = re.match(rf'^{QUOTED}\s*=>\s*(\S+)', line)
         if not m:
-            return None
+            self._err(
+                f"Invalid menu item — expected: \"Label\" => target", line)
         label = m.group(1)
         target = m.group(2)
 
@@ -1240,10 +1303,12 @@ class CompactDSLParser:
 
         item = {"label": label, "action": action_name}
 
-        # Optional hotkey
-        hm = re.search(r'HOTKEY\s+(\S+)', line, re.I)
+        # Optional hotkey — accepts HOTKEY F2 or HOTKEY "F2"; stores unquoted
+        # so tui/menu.py's `item["hotkey"] == key_name` comparison matches.
+        hm = re.search(rf'HOTKEY\s+{QUOTED}|\bHOTKEY\s+(\S+)', line, re.I)
         if hm:
-            item["hotkey"] = hm.group(1)
+            hotkey = hm.group(1) or hm.group(2) or ""
+            item["hotkey"] = hotkey.strip('"').strip()
 
         return item
 

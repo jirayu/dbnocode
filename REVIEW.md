@@ -19,6 +19,63 @@ Firebird. All screens are generated from the DSL — no application code require
 These were previously listed as open defects and have since been resolved
 (verified in the current tree):
 
+- **F4 found nothing on every document (empty lookup cache)** — the real
+  cause was in `FirebirdAdapter._query_many_inner()`: lookup tables are loaded
+  in one `UNION ALL` ("fast batch") query tagged with a literal `_src` column.
+  Firebird types a UNION string literal as `CHAR(n)` of the widest branch, so
+  `'item'` came back as `'item     '` and never matched the `by_table` key —
+  those rows were dropped without an error. Only the longest-named table
+  (`warehouse`) survived; `item`, `customer`, `po`, `vendor`, `so`, `bom`
+  all loaded as empty, so F4 on Part No / Po Number / For Customer opened a
+  picker with no rows. `_src` is now `.strip()`ped and the loader falls back to
+  sequential queries instead of dropping unmatched rows. Verified against the
+  live DB: `item` 0 → 28, `customer` 0 → 4, `po` 0 → 1, `vendor` 0 → 2.
+
+- **F4 silently dead in detail grids** — form *header* lookup fields
+  open the searchable `SearchDialog` (`tui/widgets.py`), but DETAIL grids went
+  through a second, hand-rolled picker (`Grid._show_lookup_picker`) that draws
+  directly on `stdscr`. Worse, `Grid._draw_status_bar()` returns early for
+  embedded grids (`max_height > 0`), so every early return in `_open_lookup`
+  ("no lookup on this column", "lookup returned no items") was invisible: F4
+  looked like a dead key on PO/GRN/SO/DO lines alike. Now
+  `Grid._open_lookup()` drives the same `SearchDialog` (search box,
+  arrow/PgUp/PgDn/Home/End, ENTER pick, ESC cancel, multi-column via the
+  target form's `LIST`), derives key/display fields from `lookup_list_cols`
+  (`part_no` → `part_name`, etc.), keeps the copy/fill logic, and falls back to
+  the old picker only if the dialog cannot be created. `LayoutRenderer`
+  mirrors the grid status into the hotkey bar (`_flash`) so a no-lookup column
+  explains itself, and `LookupField`/grid handlers now re-read lookup tables on
+  demand (`ScriptRunner._reload_lookups`) — the cache used to be built once at
+  startup, so a first read that failed (remote DB not ready, table created
+  later) left F4 empty for the whole session while grids still rendered rows.
+
+- **Menu selection reset on reopen** — returning to any menu restarted the
+  highlight at the first item (fresh `LayoutRenderer` every iteration +
+  hard-reset selection state in `_run_center_only`/`_run_hybrid`). Selection
+  per layout is now remembered in a shared dict
+  (`ScriptRunner._menu_sel_mem` keyed by layout name, passed into
+  `MenuManager.memory`), restored on reopen (clamped to valid, selectable
+  indexes) and updated on Enter / mouse click / first-character selection;
+  hybrid mode also restores center and per-pulldown `sel_idx`. In 2-column
+  menus each column remembers its own last position (`key\0col0`/`key\0col1`
+  + `key\0active`): reopening lands on the last-active column, and Left/Right
+  round-trips to where you were on both sides; mouse clicks record the
+  clicked column/position.
+
+- **Server hardening (auth + binding)** — `server.py` now binds
+  `127.0.0.1` only (opt-in `"bind_host"` in the company profile for LAN use,
+  with a startup warning when binding non-loopback without a password),
+  rejects browser `Origin:` headers that are not localhost (cross-site
+  WebSocket hijacking guard), and enforces an optional per-company
+  `access_password`: clients must send it as the Hrana `hello` `jwt`; the
+  backend connection is opened only *after* the hello passes, and denials
+  are logged as activity `DENIED` entries. The dialog/CLI company editors
+  expose the field, the host TUI company editor stores it for `remote`
+  profiles and sends it on connect, and the Firebird "silent rewrite to
+  `masterkey`" fallback is gone. Verified by integration smoke test
+  (wrong/no password rejected, correct password + SELECT/INSERT works,
+  open-access localhost still works, foreign origin closed, denials logged).
+
 - **Excel-to-app bootstrap** - `.xlsx`/`.xlsm` worksheets can generate
   validated compact DSL and preloaded JSON-row SQLite data through
   `main.py --import-excel` or the injected main-menu action. Generated forms use

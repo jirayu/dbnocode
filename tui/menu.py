@@ -35,6 +35,11 @@ class MenuManager:
         self._col_mem = [0, 0]
         self._col_scroll = [0, 0]
         self._split = None
+        # Cross-reopen selection memory: dict shared by the host (runner) and
+        # keyed per menu (layout name) so returning to a menu restores the
+        # last selected item instead of jumping back to the top.
+        self.memory: Optional[dict] = None
+        self.memory_key: str = ""
         self.status_line = StatusLine(stdscr)
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS |
@@ -461,6 +466,56 @@ class MenuManager:
             return self._run_hybrid()
         return ""
 
+    def _remember(self, sel):
+        """Persist the current selection into the host's shared memory."""
+        if self.memory is None or not self.memory_key:
+            return
+        if 0 <= sel < len(self._items()) and not self._is_nonsel_idx(sel):
+            self.memory[self.memory_key] = sel
+            if self._use_2col() and self._active_col in (0, 1):
+                self.memory[f"{self.memory_key}\0active"] = self._active_col
+                self.memory[f"{self.memory_key}\0col{self._active_col}"] = sel
+
+    def _stored_sel(self, fallback=0):
+        """Last remembered selection for this menu (or fallback)."""
+        if self.memory is None or not self.memory_key:
+            return fallback
+        v = self.memory.get(self.memory_key, fallback)
+        return v if isinstance(v, int) else fallback
+
+    def _stored_col_sels(self, n):
+        """Per-column remembered selections: (active_col, [sel0, sel1]).
+
+        Entries are validated against the current item range; a stale or
+        missing value falls back to 0 (first selectable via _skip_nonsel).
+        """
+        active = 0
+        if self.memory is not None and self.memory_key:
+            v = self.memory.get(f"{self.memory_key}\0active", 0)
+            if v in (0, 1):
+                active = v
+        sels = [0, 0]
+        for col in (0, 1):
+            if self.memory is not None and self.memory_key:
+                v = self.memory.get(f"{self.memory_key}\0col{col}", 0)
+                if isinstance(v, int) and 0 <= v < n:
+                    sels[col] = v
+        return active, sels
+
+    def _remember_pulldown(self, label, idx):
+        """Persist a pulldown item selection (hybrid mode)."""
+        if self.memory is None or not self.memory_key:
+            return
+        self.memory[f"{self.memory_key}\0{label}"] = idx
+
+    def _stored_pulldown_sel(self, menu):
+        """Last remembered selection for a pulldown menu (0 fallback)."""
+        if self.memory and self.memory_key:
+            v = self.memory.get(f"{self.memory_key}\0{menu['label']}", 0)
+            if isinstance(v, int) and 0 <= v < len(menu.get("items", [])):
+                return v
+        return 0
+
     def _run_center_only(self) -> str:
         """PyStock-style center menu with optional 2-column layout."""
         items = self._items()
@@ -468,17 +523,48 @@ class MenuManager:
             return ""
 
         n = len(items)
-        sel = 0
-        # Skip to first selectable
-        sel = self._skip_nonsel(sel, 1)
-        # Reset 2-col state
         self._split = None
+        if self.memory is not None and self.memory_key:
+            # Restore last selection for this menu (if still valid). In
+            # 2-column mode both columns remember their own last position and
+            # the menu reopens on the column that was last active.
+            two = self._use_2col()
+            active, sels = self._stored_col_sels(n)
+            if two:
+                col = active
+                self._active_col = col
+                s, e = self._col_range(col)
+                want = sels[col]
+                if not (s <= want < e) or self._is_nonsel_idx(want):
+                    want = self._first_sel_in_col(col)
+                sel = want
+                # Prime per-column memory so Left/Right restores each side;
+                # a stale entry falls back to each column's first selectable.
+                self._col_mem = [0, 0]
+                for c in (0, 1):
+                    cs, ce = self._col_range(c)
+                    want = sels[c]
+                    if cs <= want < ce and not self._is_nonsel_idx(want):
+                        self._col_mem[c] = want
+                self._col_mem[col] = sel
+            else:
+                stored = sels[active] if (0 <= sels[active] < n) else 0
+                sel = self._skip_nonsel(stored, 1)
+                self._active_col = 0
+                self._col_mem = [0, 0]
+        else:
+            sel = 0
+            # Skip to first selectable
+            sel = self._skip_nonsel(sel, 1)
+            # Reset 2-col state
+            self._col_scroll = [0, 0]
+            self._active_col = 0
+            self._col_mem = [0, 0]
         self._col_scroll = [0, 0]
-        self._active_col = 0
-        self._col_mem = [0, 0]
 
         while True:
             self._ensure_visible(sel)
+            self._remember(sel)
             self.stdscr.erase()
             self._draw_center_menu(sel)
             self.stdscr.refresh()
@@ -495,6 +581,10 @@ class MenuManager:
                     if bstate & click:
                         clicked = self._mouse_menu_index(mx, my)
                         if clicked is not None:
+                            if self._use_2col():
+                                self._active_col = self._col_of(clicked)
+                                self._col_mem[self._active_col] = clicked
+                            self._remember(clicked)
                             return items[clicked].get("action", "")
                 except curses.error:
                     pass
@@ -549,6 +639,7 @@ class MenuManager:
                             if lbl and lbl[0].upper() == ch:
                                 sel = i
                                 self._active_col = self._col_of(i)
+                                self._remember(sel)
                                 return items[i].get("action", "")
                 elif key == curses.KEY_RESIZE:
                     self._split = None  # recalculate on resize
@@ -569,6 +660,7 @@ class MenuManager:
                     sel = self._skip_nonsel(sel, 1)
                 elif key in (curses.KEY_ENTER, 10, 13, curses.PADENTER):
                     if 0 <= sel < n and not self._is_nonsel_idx(sel):
+                        self._remember(sel)
                         return items[sel].get("action", "")
                 elif key == 27:  # ESC
                     return ""
@@ -578,6 +670,7 @@ class MenuManager:
                         if not self._is_nonsel(item):
                             lbl = item.get("label", "").lstrip()
                             if lbl and lbl[0].upper() == ch:
+                                self._remember(i)
                                 return items[i].get("action", "")
                 elif key == curses.KEY_RESIZE:
                     self._split = None
@@ -586,11 +679,21 @@ class MenuManager:
     def _run_hybrid(self) -> str:
         """Hybrid mode: top bar with pulldown menus."""
         if self.center_menu:
-            self.center_menu["sel_idx"] = 0
+            # Restore last selection instead of always restarting at the top
+            items = self._items()
+            stored = self._stored_sel(0)
+            if not (0 <= stored < len(items)):
+                stored = 0
+            self.center_menu["sel_idx"] = self._skip_nonsel(stored, 1)
         # Auto-open first pulldown when there's no center menu
         if not self.center_menu and self.top_menus and not self.active_pulldown:
             self.active_pulldown = self.top_menus[0]["label"]
-            self.top_menus[0]["sel_idx"] = 0
+            m = self.top_menus[0]
+            stored = self.memory.get(
+                f"{self.memory_key}\0{m['label']}", 0) if (self.memory and self.memory_key) else 0
+            if not (0 <= stored < len(m["items"])):
+                stored = 0
+            m["sel_idx"] = stored
         while True:
             self.stdscr.clear()
             if self.top_menus:
@@ -622,12 +725,12 @@ class MenuManager:
                 if key == curses.KEY_LEFT:
                     idx = next(i for i,m in enumerate(self.top_menus) if m["label"] == self.active_pulldown)
                     new_menu = self.top_menus[(idx-1)%len(self.top_menus)]
-                    new_menu["sel_idx"] = 0
+                    new_menu["sel_idx"] = self._stored_pulldown_sel(new_menu)
                     self.active_pulldown = new_menu["label"]
                 elif key == curses.KEY_RIGHT:
                     idx = next(i for i,m in enumerate(self.top_menus) if m["label"] == self.active_pulldown)
                     new_menu = self.top_menus[(idx+1)%len(self.top_menus)]
-                    new_menu["sel_idx"] = 0
+                    new_menu["sel_idx"] = self._stored_pulldown_sel(new_menu)
                     self.active_pulldown = new_menu["label"]
                 elif key == curses.KEY_UP:
                     m = next(m for m in self.top_menus if m["label"] == self.active_pulldown)
@@ -653,6 +756,7 @@ class MenuManager:
                                 m["sel_idx"] = j; break
                 elif key in (curses.KEY_ENTER, 10, 13, curses.PADENTER):
                     m = next(m for m in self.top_menus if m["label"] == self.active_pulldown)
+                    self._remember_pulldown(m["label"], m.get("sel_idx", 0))
                     return m["items"][m.get("sel_idx", 0)]["action"]
                 elif key == 27:
                     if self.center_menu:
@@ -660,7 +764,8 @@ class MenuManager:
                     else:
                         # Pulldown-only mode — keep first pulldown open
                         self.active_pulldown = self.top_menus[0]["label"]
-                        self.top_menus[0]["sel_idx"] = 0
+                        self.top_menus[0]["sel_idx"] = self._stored_pulldown_sel(
+                            self.top_menus[0])
             else:
                 # Navigate center menu
                 if self.center_menu:
@@ -676,6 +781,7 @@ class MenuManager:
                         self.center_menu["sel_idx"] = sel_idx
                     elif key in (curses.KEY_ENTER, 10, 13, curses.PADENTER):
                         if not self._is_nonsel_idx(sel_idx):
+                            self._remember(sel_idx)
                             return items[sel_idx].get("action", "")
                     elif 32 <= key <= 126:
                         ch = chr(key).upper()
@@ -683,6 +789,7 @@ class MenuManager:
                             if not self._is_nonsel(item):
                                 lbl = item.get("label", "").lstrip()
                                 if lbl and lbl[0].upper() == ch:
+                                    self._remember(i)
                                     return items[i].get("action", "")
                     elif key == 27:
                         return ""

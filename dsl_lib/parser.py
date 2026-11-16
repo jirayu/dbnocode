@@ -2,13 +2,15 @@ import re
 from typing import Dict, List, Any
 from collections import defaultdict
 
+from dsl_lib._text import strip_comments
+
 QUOTED = r'"([^"]+)"'
 INT = r'(\d+)'
 
 class DSLParser:
     def __init__(self, text: str):
         self.raw = text
-        self.lines = [re.sub(r'//.*', '', l).strip() for l in text.splitlines() if l.strip()]
+        self.lines = [strip_comments(l).strip() for l in text.splitlines() if l.strip()]
         self.pos = 0
         self.app = {}
 

@@ -5,6 +5,12 @@ import sqlite3
 import time
 from typing import List, Dict, Any, Optional
 
+try:
+    from docstore import ConcurrencyError  # noqa: F401
+except ImportError:  # pragma: no cover - docstore always present in this repo
+    class ConcurrencyError(Exception):
+        pass
+
 _perf_log = logging.getLogger("perf")
 _perf_log.setLevel(logging.DEBUG)
 if not _perf_log.handlers:
@@ -89,6 +95,10 @@ class SQLiteAdapter:
         return sorted(f for f in fields if not f.startswith("_"))
 
 
+class ConnectionLost(RuntimeError):
+    """WebSocket transport failure — connection dropped mid-session."""
+
+
 class RemoteSQLAdapter:
     """Adapter for a remote libSQL/sqld server via Hrana 2 WebSocket.
 
@@ -98,10 +108,17 @@ class RemoteSQLAdapter:
     Requires the ``websocket-client`` package.
     """
 
-    def __init__(self, db_url: str, auth_token: str = ""):
+    def __init__(self, db_url: str, auth_token: str = "",
+                 io_timeout: float = 10.0):
         self.db_url = db_url.rstrip("/")
         self.db_path = self.db_url
         self.auth_token = auth_token
+        # Socket timeout for every send/recv after the handshake.  The old
+        # hard-coded 3s was tighter than real-world WAN round-trips (connect
+        # alone was measured at 2.1s; a lookup query hit 2.099s) — one burst
+        # of latency raised ConnectionLost mid-batch and killed F4 lookups
+        # for the whole session.
+        self.io_timeout = io_timeout
         self._ws: Optional[Any] = None
         self._next_req_id = 1
         self._next_stream_id = 1
@@ -115,12 +132,18 @@ class RemoteSQLAdapter:
 
     # -- Hrana 2 low-level helpers --------------------------------------------
     def _send(self, msg: dict):
-        self._ws.send(json.dumps(msg))
+        try:
+            self._ws.send(json.dumps(msg))
+        except Exception as exc:
+            raise ConnectionLost(f"WebSocket send failed: {exc}") from exc
 
     def _recv(self) -> dict:
-        raw = self._ws.recv()
+        try:
+            raw = self._ws.recv()
+        except Exception as exc:
+            raise ConnectionLost(f"WebSocket recv failed: {exc}") from exc
         if raw in (None, ""):
-            raise RuntimeError("Hrana server closed the connection before sending a response")
+            raise ConnectionLost("Hrana server closed the connection before sending a response")
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -190,9 +213,7 @@ class RemoteSQLAdapter:
                 "stmt": stmt,
             })
             response = self._recv_response(rid)
-        except RuntimeError:
-            raise  # SQL/Hrana errors — don't reconnect
-        except Exception:
+        except ConnectionLost:
             if self._in_txn:
                 # Inside transaction — reconnect would lose tx state.
                 # Raise so caller can retry the whole transaction.
@@ -201,7 +222,6 @@ class RemoteSQLAdapter:
                 self._in_txn = False
                 raise
             # Connection/transport failure — reconnect and retry once.
-            # Catches OSError, AttributeError, WebSocketConnectionClosedException, etc.
             self.connect()
             rid = self._send_request({
                 "type": "execute",
@@ -228,7 +248,7 @@ class RemoteSQLAdapter:
             self._ws = create_connection(
                 self.db_url,
                 subprotocols=["hrana2"],
-                timeout=3,
+                timeout=self.io_timeout,
             )
         except TimeoutError as exc:
             raise RuntimeError(
@@ -281,10 +301,25 @@ class RemoteSQLAdapter:
 
         Each entry in *queries* is (sql, params).
         Returns a list of result sets, one per query.
+        Retries once on a dropped connection (SELECT batches are idempotent);
+        the previous behaviour let one 3s timeout during the startup lookup
+        batch leave every F4 lookup empty for the rest of the session.
         """
-        t0 = time.perf_counter()
         if self._ws is None:
             self.connect()
+        try:
+            return self._query_many_inner(queries)
+        except ConnectionLost:
+            if self._in_txn:
+                self._ws = None
+                self._stream_id = None
+                self._in_txn = False
+                raise
+            self.connect()
+            return self._query_many_inner(queries)
+
+    def _query_many_inner(self, queries: List[tuple]) -> List[List[Dict]]:
+        t0 = time.perf_counter()
         steps = []
         for sql, params in queries:
             stmt: dict = {"sql": sql, "want_rows": True}
@@ -696,7 +731,9 @@ class FirebirdAdapter:
                 cur.execute(union_sql)
                 # Split results by _src
                 by_table = {t: [] for t in table_names}
+                fetched = 0
                 for row in cur.fetchall():
+                    fetched += 1
                     src = row[0]
                     rid = row[1]
                     data = row[2]
@@ -706,8 +743,19 @@ class FirebirdAdapter:
                         src = src.decode('utf-8', errors='replace')
                     if isinstance(data, bytes):
                         data = data.decode('utf-8', errors='replace')
+                    # Firebird types a UNION's string literal as CHAR(n) where
+                    # n is the widest branch, so 'item' comes back as
+                    # 'item     '. Without stripping, only a table whose name
+                    # is already the longest would ever match and every other
+                    # lookup table silently loaded as empty.
+                    if isinstance(src, str):
+                        src = src.strip()
                     if src in by_table:
                         by_table[src].append({"rowid": rid, "data": data})
+                if sum(len(v) for v in by_table.values()) < fetched:
+                    # Unmatched tags — never drop rows silently, use the
+                    # sequential path instead.
+                    raise ValueError("lookup batch returned unmatched _src tags")
                 return [by_table[t] for t in table_names]
             except Exception:
                 pass  # fall through to sequential
@@ -892,6 +940,257 @@ class FirebirdAdapter:
             except (json.JSONDecodeError, TypeError):
                 pass
         return sorted(f for f in fields if not f.startswith("_"))
+
+
+class FirebirdDocStoreAdapter:
+    """Firebird document-store adapter wrapping :class:`docstore.DocStore`.
+
+    Presents the same adapter interface as :class:`FirebirdAdapter`
+    (``query``/``execute``/``begin``/``commit``/``rollback``/
+    ``get_table_names``/``discover_fields``) but stores each document as one
+    JSON row in ``NC_DOC`` with flattened scalar leaves in ``NC_IDX``.
+
+    Intended for master/detail/sub-detail document entities (PO, GRN, invoice,
+    ...) where deep nesting makes flat tables awkward.  All entities share the
+    same two physical tables; ``ENTITY`` column separates document types.
+
+    Constructor signature matches :class:`FirebirdAdapter` for drop-in use:
+
+        adapter = FirebirdDocStoreAdapter(host="localhost", port=3050,
+                                          db="mydb.fdb", user="sysdba",
+                                          pwd="masterkey")
+    """
+
+    def __init__(self, host: str = "localhost", port: int = 3050,
+                 db: str = "", user: str = "sysdba", pwd: str = "masterkey"):
+        self.host = host
+        self.port = port
+        self.db = db
+        self.db_path = db
+        self.user = user
+        self.pwd = pwd
+        self._in_txn = False
+        self._store = None
+        self._dsn = self._build_dsn(host, port, db)
+
+    @staticmethod
+    def _build_dsn(host: str, port: int, db: str) -> str:
+        """Build a firebird-driver DSN from host/port/db."""
+        if not db:
+            return db
+        # Already a full DSN (contains ":/")
+        if ":/ " in db or ":///" in db or ":" in db.split("/")[0]:
+            return db
+        host = host or "localhost"
+        if port == 3050:
+            return f"{host}:{db}"
+        return f"{host}/{port}:{db}"
+
+    # -- connection ---------------------------------------------------------
+
+    def connect(self):
+        from docstore import DocStore  # lazy import to avoid hard dependency
+        self._store = DocStore(self._dsn, user=self.user, password=self.pwd)
+        self._store.create_schema()  # idempotent — ensures NC_DOC/NC_IDX exist
+        self._in_txn = False
+
+    def disconnect(self):
+        if self._store:
+            try:
+                self._store.close()
+            except Exception:
+                pass
+            self._store = None
+        self._in_txn = False
+
+    def close(self):
+        """Alias for disconnect() — called by server.py's finally block."""
+        self.disconnect()
+
+    @property
+    def con(self):
+        return self._store.con if self._store else None
+
+    # -- SQL-ish helpers ----------------------------------------------------
+
+    @staticmethod
+    def _parse_table(sql: str) -> Optional[str]:
+        import re
+        m = re.search(r'"([^"]+)"', sql)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _parse_rowid(sql: str, params: tuple) -> Optional[int]:
+        """Extract the rowid value from ``WHERE rowid = ?``.
+
+        Counts how many ``?`` placeholders precede the ``rowid = ?`` marker to
+        pick the correct positional parameter (e.g. for UPDATE ... SET data = ?
+        WHERE rowid = ?, the rowid is at index 1, not 0).
+        """
+        import re
+        m = re.search(r'rowid\s*=\s*\?', sql, re.IGNORECASE)
+        if m and params:
+            # Count ? marks before the match position to find the right index.
+            idx = sql[:m.start()].count("?")
+            try:
+                return int(params[idx])
+            except (ValueError, TypeError, IndexError):
+                pass
+        return None
+
+    # -- query --------------------------------------------------------------
+
+    def query(self, sql: str, params: tuple = ()) -> List[Dict]:
+        if not self._store:
+            self.connect()
+        upper = sql.strip().upper()
+        table = self._parse_table(sql)
+        if not table:
+            return []
+
+        if upper.startswith("SELECT"):
+            # SELECT rowid, data FROM "table" [WHERE rowid = ?]
+            if "WHERE" in upper and "ROWID" in upper:
+                doc_id = self._parse_rowid(sql, params)
+                if doc_id is None:
+                    return []
+                loaded = self._store.load(doc_id)
+                if not loaded:
+                    return []
+                return [{"rowid": loaded["id"],
+                         "data": json.dumps(loaded["data"])}]
+            else:
+                # All docs of this entity
+                ids = self._store.find(table, [], limit=10000)
+                result = []
+                for doc_id in ids:
+                    loaded = self._store.load(doc_id)
+                    if loaded:
+                        result.append({
+                            "rowid": loaded["id"],
+                            "data": json.dumps(loaded["data"]),
+                        })
+                return result
+        return []
+
+    # -- execute ------------------------------------------------------------
+
+    def execute(self, sql: str, params: tuple = ()):
+        if not self._store:
+            self.connect()
+        upper = sql.strip().upper()
+        table = self._parse_table(sql)
+
+        if upper.startswith("CREATE TABLE"):
+            # DocStore uses shared NC_DOC/NC_IDX — nothing to create per table.
+            if not self._in_txn:
+                self._store.con.commit()
+            return 0, None
+
+        if upper.startswith("INSERT"):
+            # INSERT INTO "table" (data) VALUES (?)
+            doc = json.loads(params[0]) if params and params[0] else {}
+            doc_id, ver = self._store.save(
+                table, doc, commit=not self._in_txn)
+            return 1, doc_id
+
+        if upper.startswith("UPDATE"):
+            # UPDATE "table" SET data = ? WHERE rowid = ?
+            doc_id = self._parse_rowid(sql, params)
+            data_str = params[0] if params and len(params) > 0 else "{}"
+            doc = json.loads(data_str) if isinstance(data_str, str) else {}
+            if doc_id is not None:
+                loaded = self._store.load(doc_id)
+                ver = loaded["ver"] if loaded else None
+                try:
+                    new_id, new_ver = self._store.save(
+                        table, doc, doc_id=doc_id, ver=ver,
+                        commit=not self._in_txn)
+                    return 1, new_id
+                except ConcurrencyError:
+                    return 0, None
+            return 0, None
+
+        if upper.startswith("DELETE"):
+            if "WHERE" in upper and "ROWID" in upper:
+                doc_id = self._parse_rowid(sql, params)
+                if doc_id is not None:
+                    self._store.delete(doc_id, commit=not self._in_txn)
+                    return 1, None
+            return 0, None
+
+        return 0, None
+
+    # -- batch / transactions ----------------------------------------------
+
+    def execute_many(self, stmts):
+        if not self._store:
+            self.connect()
+        was_in_txn = self._in_txn
+        self._in_txn = True
+        try:
+            for sql, params in stmts:
+                self.execute(sql, params)
+            if not was_in_txn:
+                self._store.con.commit()
+        except Exception:
+            if not was_in_txn:
+                try:
+                    self._store.con.rollback()
+                except Exception:
+                    pass
+            raise
+        finally:
+            self._in_txn = was_in_txn
+
+    def begin(self):
+        if not self._store:
+            self.connect()
+        self._in_txn = True
+
+    def commit(self):
+        if self._store:
+            self._store.con.commit()
+        self._in_txn = False
+
+    def rollback(self):
+        if self._store:
+            self._store.con.rollback()
+        self._in_txn = False
+
+    # -- metadata -----------------------------------------------------------
+
+    def get_table_names(self) -> List[str]:
+        if not self._store:
+            self.connect()
+        # Distinct entities stored in NC_DOC
+        try:
+            cur = self._store.con.cursor()
+            cur.execute("SELECT DISTINCT ENTITY FROM NC_DOC ORDER BY ENTITY")
+            rows = cur.fetchall()
+            cur.close()
+            return [r[0] for r in rows]
+        except Exception:
+            return []
+
+    def discover_fields(self, table_name: str, limit: int = 50) -> List[str]:
+        if not self._store:
+            self.connect()
+        from docstore import REGISTRY
+        paths = REGISTRY.get(table_name)
+        if paths:
+            return sorted(p for p in paths if p is not None)
+        # Fallback: discover from sample documents
+        try:
+            ids = self._store.find(table_name, [], limit=limit)
+            fields = set()
+            for doc_id in ids:
+                loaded = self._store.load(doc_id)
+                if loaded and isinstance(loaded.get("data"), dict):
+                    fields.update(loaded["data"].keys())
+            return sorted(f for f in fields if not f.startswith("_"))
+        except Exception:
+            return []
 
 
 class PostgreSQLAdapter:

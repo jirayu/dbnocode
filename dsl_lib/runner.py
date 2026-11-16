@@ -8,7 +8,7 @@ from typing import Dict, Any, List
 from tui import LayoutRenderer
 from tui.layout import eval_computed_formula
 from tui.themes import init_colors as _init_theme_colors
-from dsl_lib.adapters import SQLiteAdapter, PostgreSQLAdapter, RemoteSQLAdapter, FirebirdAdapter
+from dsl_lib.adapters import SQLiteAdapter, PostgreSQLAdapter, RemoteSQLAdapter, FirebirdAdapter, FirebirdDocStoreAdapter
 from dsl_lib.script_engine import ScriptExecutor, ScriptError
 
 
@@ -26,12 +26,16 @@ class ScriptRunner:
         self.column_configs = {}  # grid_id -> list of (name, visible, width) tuples
         self.sort_configs = {}    # grid_id -> (col_name, ascending) — session only
         self._list_view_idx = {}  # grid_id -> current LISTVIEW index
+        self._crud_list_pos = {}  # layout_name -> (row, scroll_offset)
         self.company_name = ""    # current company display name
         self._lookups_dirty = False  # set True after save to trigger lookup reload
         self._tables_ensured = set()  # DB URLs/paths where tables already created
         # In-memory cache for ENTRY-mode grids: (form_id, rowid_or_None) -> grid row list.
         # Survives filter (F7) and navigation back to the same Draft; cleared on F10 save.
         self._entry_grid_cache: Dict[tuple, list] = {}
+        # Remembered menu selection per layout name — survives returning to a
+        # menu so it reopens on the previously selected item, not the top.
+        self._menu_sel_mem: Dict[str, int] = {}
         self._init_database()
         self._ensure_tables()
         self._load_column_configs()
@@ -147,8 +151,16 @@ class ScriptRunner:
                     db=active.get("database", ""),
                     user=active.get("user", "sysdba"),
                     pwd=active.get("password", "masterkey"))
+            elif active.get("adapter") == "firebird-docstore" and not db_url:
+                self.db = FirebirdDocStoreAdapter(
+                    host=active.get("host", "localhost"),
+                    port=int(active.get("port", 3050)),
+                    db=active.get("database", ""),
+                    user=active.get("user", "sysdba"),
+                    pwd=active.get("password", "masterkey"))
             elif db_url:
-                auth_token = active.get("auth_token", "")
+                auth_token = (active.get("access_password", "")
+                              or active.get("auth_token", ""))
                 self.db = RemoteSQLAdapter(db_url, auth_token)
             else:
                 self.db = SQLiteAdapter(active.get("db_file", "app.db"))
@@ -202,6 +214,14 @@ class ScriptRunner:
                 )
             elif adapter == "firebird":
                 self.db = FirebirdAdapter(
+                    host=os.environ.get("DB_HOST", "localhost"),
+                    port=int(os.environ.get("DB_PORT", "3050")),
+                    db=os.environ.get("DB_NAME", ""),
+                    user=os.environ.get("DB_USER", "sysdba"),
+                    pwd=os.environ.get("DB_PASS", "masterkey")
+                )
+            elif adapter == "firebird-docstore":
+                self.db = FirebirdDocStoreAdapter(
                     host=os.environ.get("DB_HOST", "localhost"),
                     port=int(os.environ.get("DB_PORT", "3050")),
                     db=os.environ.get("DB_NAME", ""),
@@ -702,9 +722,18 @@ class ScriptRunner:
                 db=company.get("database", ""),
                 user=company.get("user", "sysdba"),
                 pwd=company.get("password", "masterkey"))
+        elif company.get("adapter") == "firebird-docstore" and not db_url:
+            # Direct Firebird document-store connection
+            self.db = FirebirdDocStoreAdapter(
+                host=company.get("host", "localhost"),
+                port=int(company.get("port", 3050)),
+                db=company.get("database", ""),
+                user=company.get("user", "sysdba"),
+                pwd=company.get("password", "masterkey"))
         elif db_url:
             # Remote via WebSocket — works for both SQLite server and FBServer
-            auth_token = company.get("auth_token", "")
+            auth_token = (company.get("access_password", "")
+                          or company.get("auth_token", ""))
             self.db = RemoteSQLAdapter(db_url, auth_token)
         else:
             self.db = SQLiteAdapter(company.get("db_file", "app.db"))
@@ -1183,6 +1212,8 @@ class ScriptRunner:
                 db_name = (existing.get("db_name", "")
                            or existing.get("db_file", "")
                            or existing.get("database", ""))
+                password = (existing.get("access_password", "")
+                            or existing.get("auth_token", ""))
             else:
                 adapter_idx = 0  # local SQLite
                 db_name = existing.get("db_file", "")
@@ -1197,7 +1228,7 @@ class ScriptRunner:
 
         hints = {
             "sqlite":    "Local .db file. Database = filename.",
-            "remote":    "Unified Server.exe. Host + Port connect. Database is server-side label/path only.",
+            "remote":    "Unified Server.exe. Host + Port connect. Access Pwd = the server company's access_password (blank = none).",
             "firebird":  "Direct Firebird. Database = path to .fdb",
             "remote-fb": "Legacy Firebird WebSocket profile. Prefer remote on unified Server.exe.",
         }
@@ -1214,13 +1245,15 @@ class ScriptRunner:
                 labels = list(base_labels)
                 if cur_type == "remote":
                     labels[4] = "Server DB Label:"
+                    labels[6] = "Access Pwd:  "
                 elif cur_type == "sqlite":
                     labels[4] = "Database File:"
                 elif cur_type in ("firebird", "remote-fb"):
                     labels[4] = "Database Path:"
                 for fi in range(field_count):
-                    # Hide user/password for non-firebird types
-                    if fi >= 5 and cur_type not in ("firebird", "remote-fb"):
+                    # Hide the User field for non-firebird types; hide the
+                    # Password/Access-Pwd field for sqlite only.
+                    if fi >= 5 and cur_type not in ("firebird", "remote-fb", "remote"):
                         continue
                     row_y = 2 + fi * 2
                     if row_y >= box_h - 3:
@@ -1260,12 +1293,18 @@ class ScriptRunner:
 
             if key in (9, curses.KEY_ENTER, 10, 13, curses.PADENTER):  # Tab or Enter = next field
                 field_idx = (field_idx + 1) % field_count
-                # Skip user/password fields for non-firebird types
-                while field_idx >= 5 and fields[0] not in ("firebird", "remote-fb"):
+                # Skip hidden fields: User always, Access-Pwd for sqlite only
+                while ((field_idx == 5
+                        and fields[0] not in ("firebird", "remote-fb"))
+                       or (field_idx == 6
+                           and fields[0] not in ("firebird", "remote-fb", "remote"))):
                     field_idx = (field_idx + 1) % field_count
             elif key == 353:  # Shift+Tab = previous field
                 field_idx = (field_idx - 1) % field_count
-                while field_idx >= 5 and fields[0] not in ("firebird", "remote-fb"):
+                while ((field_idx == 5
+                        and fields[0] not in ("firebird", "remote-fb"))
+                       or (field_idx == 6
+                           and fields[0] not in ("firebird", "remote-fb", "remote"))):
                     field_idx = (field_idx - 1) % field_count
             elif key == 32 and field_idx == 0:  # Space on type field
                 adapter_idx = (adapter_idx + 1) % len(adapter_types)
@@ -1327,6 +1366,8 @@ class ScriptRunner:
                     if not port:
                         port = "8081"
                     result["db_url"] = f"ws://{host}:{port}"
+                    if password:
+                        result["access_password"] = password
                 else:
                     if not db_name:
                         db_name = company.replace(" ", "_").lower()
@@ -2841,6 +2882,21 @@ class ScriptRunner:
             ]
         return lookups
 
+    def _reload_lookups(self) -> Dict[str, list]:
+        """Re-read lookup tables and refresh the shared cache in place.
+
+        The cache is built once at startup; if that read failed (remote server
+        not ready yet, table created later) F4 lookups stayed empty for the
+        whole session. Screens call this on demand so the cache can heal.
+        """
+        fresh = self._load_lookups()
+        if isinstance(self.lookup_data, dict):
+            self.lookup_data.clear()
+            self.lookup_data.update(fresh)
+            return self.lookup_data
+        self.lookup_data = fresh
+        return fresh
+
     def _next_doc_no(self, form_id: str, field_id: str, prefix: str,
                      fmt: str = None) -> str:
         """Generate next running number.
@@ -3424,6 +3480,7 @@ class ScriptRunner:
                        start_y=grid_y, start_x=1,
                        show_totals=grid_def.get("show_totals", False))
         grid._grid_id = entry_grid_id
+        grid.allow_editing_columns({"part_name", "description"})
         grid.lookup_handler = self._make_entry_lookup_handler()
 
         # Apply saved column config (visibility + order, not width — stretch handles width)
@@ -3601,9 +3658,9 @@ class ScriptRunner:
                     merged[comp["name"]] = val
                     comp_parts.append(f"{comp['name']}: {val}")
             if editing_existing:
-                hint = "F5 Workflow  Ctrl+D Del Row  F10 Save  ESC Back"
+                hint = "F5 Workflow  Ctrl+D/Del Del Row  Ctrl+Ins Ins Row  F10 Save  ESC Back"
             else:
-                hint = "Ctrl+D Del Row  F5 Undo  F7 Filter  F10 Save  ESC Cancel"
+                hint = "Ctrl+D/Del Del Row  Ctrl+Ins Ins Row  F5 Undo  F7 Filter  F10 Save  ESC Cancel"
             comp_str = "  ".join(comp_parts)
             try:
                 stdscr.move(2, 0)
@@ -3705,8 +3762,11 @@ class ScriptRunner:
                 _start_edit()
                 continue
 
-            # Ctrl+D: delete current detail row (deferred — not saved until F10)
-            if key == 4:
+            # Ctrl+D / Ctrl+Delete: delete current detail row (deferred — not
+            # saved until F10).  windows-curses reports Ctrl+Delete as the
+            # extended keycode 527; plain Delete arrives as KEY_DC.
+            if (key in (4, 527)
+                    or (key == curses.KEY_DC and not editing)):
                 _save_cell()
                 editing = False
                 grid.edit_mode = False
@@ -3719,6 +3779,16 @@ class ScriptRunner:
                         _start_edit()
                 continue
 
+            # Ctrl+Insert / Insert: insert a blank row at the current row
+            # position (windows-curses reports Ctrl+Insert as 477; plain
+            # Insert arrives as KEY_IC).
+            if key in (curses.KEY_IC, 477) and not editing:
+                _save_cell()
+                if grid.insert_row_here():
+                    need_full_redraw = True
+                _start_edit()
+                continue
+
             # F5: undo last row deletion
             if key == curses.KEY_F5 and not editing_existing:
                 _save_cell()
@@ -3728,17 +3798,6 @@ class ScriptRunner:
                 grid.undo_last_deletion()
                 need_full_redraw = True
                 _start_edit()
-                continue
-
-            # Del (non-editing): clear current cell value
-            if key == curses.KEY_DC and not editing:
-                if coedit_indices and grid._view_indices:
-                    data_idx = grid._data_index(grid.row)
-                    if data_idx >= 0 and ce_ci >= 0:
-                        col = grid.columns[ce_ci]
-                        grid.data[data_idx][col.name] = ""
-                        grid.set_status(f"{col.name} cleared")
-                        need_full_redraw = True
                 continue
 
             # F10 or Ctrl+S: save
@@ -4117,10 +4176,27 @@ class ScriptRunner:
 
     def _make_entry_lookup_handler(self):
         """Create a lookup handler for entry mode grids."""
-        lookup_data = self.lookup_data
+        last_heal = {"at": 0.0}
 
         def handler(lookup_name, val, list_all=False, full_record=False):
-            items = lookup_data.get(lookup_name, [])
+            # Read the cache through self (not a captured reference) so a
+            # reload or company switch is always visible to this handler.
+            items = self.lookup_data.get(lookup_name, [])
+            if list_all and not items:
+                # Empty cached lookup — first load failed (remote server not
+                # ready yet, connection hiccup mid-batch) or the table was
+                # created later. Try one throttled reload before showing an
+                # empty picker; layout-built grids get the same heal from
+                # LayoutRenderer._refresh_lookup_data.
+                import time as _time
+                now = _time.monotonic()
+                if now - last_heal["at"] >= 5.0:
+                    last_heal["at"] = now
+                    try:
+                        self._reload_lookups()
+                    except Exception:
+                        pass
+                items = self.lookup_data.get(lookup_name, [])
             if list_all:
                 if full_record:
                     # Return full record dicts for multi-column picker
@@ -4167,7 +4243,10 @@ class ScriptRunner:
     def _show_message(stdscr, msg):
         """Show a centered message popup, dismiss on any key."""
         max_y, max_x = stdscr.getmaxyx()
-        box_w = len(msg) + 4
+        # Clamp so a message longer than the terminal can't fail newwin and
+        # silently skip the whole popup (message AND getch) — errors must be
+        # visible, wrapped to the box height below.
+        box_w = min(len(msg) + 4, max(10, max_x - 4))
         box_h = 5
         y = max(0, (max_y - box_h) // 2)
         x = max(0, (max_x - box_w) // 2)
@@ -4175,7 +4254,10 @@ class ScriptRunner:
             win = curses.newwin(box_h, box_w, y, x)
             win.attron(curses.A_BOLD)
             win.border()
-            win.addstr(2, 2, msg, curses.A_NORMAL)
+            inner_w = max(1, box_w - 4)
+            lines = [msg[i:i + inner_w] for i in range(0, len(msg), inner_w)][:3]
+            for li, line in enumerate(lines):
+                win.addstr(1 + li, 2, line, curses.A_NORMAL)
             win.refresh()
             stdscr.nodelay(False)
             stdscr.getch()
@@ -5990,13 +6072,23 @@ class ScriptRunner:
                 db=self.db,
                 app_grids=self.app["grids"],
                 default_resolver=self._resolve_default,
-                user_context=self.current_user
+                user_context=self.current_user,
+                menu_memory=self._menu_sel_mem,
+                layout_name=current_layout,
+                lookup_loader=self._reload_lookups
             )
             # Pass LISTVIEW index to grids for label display
             for g in renderer.cxgrids:
                 gid = getattr(g, '_grid_id', '')
                 if gid:
                     g._view_idx = self._list_view_idx.get(gid, 0)
+            # Restore CRUD list grid position after tab switch
+            if current_layout in self._crud_list_pos and renderer.cxgrids:
+                saved_row, saved_offset = self._crud_list_pos[current_layout]
+                g = renderer.cxgrids[0]
+                max_row = len(g._view_indices) - 1 if g._view_indices else 0
+                g.row = min(saved_row, max_row)
+                g.scroll_offset = min(saved_offset, max(0, len(g._view_indices) - g.visible_rows))
             action = renderer.run_menu()
             # Persist any column config changes made via F8
             self._save_column_configs()
@@ -6166,6 +6258,10 @@ class ScriptRunner:
 
             elif action == "__edit__":
                 # Enter on grid row: load selected row into form for editing
+                # Save grid position so we return to the same row after editing
+                if renderer.cxgrids:
+                    g = renderer.cxgrids[0]
+                    self._crud_list_pos[current_layout] = (g.row, g.scroll_offset)
                 row = renderer.get_selected_row()
                 if row:
                     parent_form = self._find_grid_parent_form(layout_def)
@@ -6214,7 +6310,10 @@ class ScriptRunner:
                 continue
 
             elif action == "__new__":
-                # F3: new blank record
+                # F3: new blank record — save grid position for return
+                if renderer.cxgrids:
+                    g = renderer.cxgrids[0]
+                    self._crud_list_pos[current_layout] = (g.row, g.scroll_offset)
                 parent_form = self._find_grid_parent_form(layout_def)
                 if parent_form:
                     form_layout = self._find_form_layout(parent_form)
@@ -6228,6 +6327,10 @@ class ScriptRunner:
             elif action == "__crud_form__":
                 # Open the blank Form and Edit tab without growing navigation
                 # history; both generated layouts are one logical screen.
+                # Save grid position so we can restore it on return.
+                if renderer.cxgrids:
+                    g = renderer.cxgrids[0]
+                    self._crud_list_pos[current_layout] = (g.row, g.scroll_offset)
                 peer = (layout_def.get("crud_tabs") or {}).get("peer")
                 if peer in self.app["layouts"]:
                     self.edit_context = None

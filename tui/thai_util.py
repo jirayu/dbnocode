@@ -30,6 +30,56 @@ except Exception:  # pragma: no cover - optional dependency
     _wcwidth = None
 
 
+def has_thai(s):
+    """True when s contains Thai script characters (U+0E00–U+0E7F).
+
+    Used by the grid to swap Thai cell text for an ASCII placeholder: curses
+    column math counts combining vowels/tone marks as full cells while the
+    terminal renders them zero-width, so raw Thai in a grid always renders
+    crooked. Thai shows fully in the Alt-L popup and the printed PDF.
+    """
+    try:
+        return any("\u0e00" <= ch <= "\u0e7f" for ch in s)
+    except TypeError:
+        return False
+
+
+# Thai combining vowels/tone marks — zero display width. NOTE:
+# unicodedata.combining() returns 0 for these (canonical combining class 0),
+# so they must be listed explicitly.
+_THAI_COMBINING = ({0x0E31}
+                   | set(range(0x0E34, 0x0E3B))
+                   | set(range(0x0E47, 0x0E4F)))
+
+
+def mask_thai(s, mask_char="*"):
+    """ASCII mask for text that contains Thai — one '*' per base character
+    (combining vowels/tone marks are not counted: they render zero-width).
+
+    Used by the Alt-L editor so Thai is never drawn on screen at all while
+    typing — PDCurses renders combining marks as separate cells, which looks
+    broken. The typed value itself stays real Thai for printing. Text
+    without Thai is returned unchanged.
+    """
+    if not has_thai(s):
+        return s
+    n = sum(1 for ch in str(s) if ord(ch) not in _THAI_COMBINING)
+    return mask_char * max(n, 1)
+
+
+def strip_thai(s):
+    """Remove Thai characters from a string for on-screen display, keeping
+    the ASCII/English parts as-is (whitespace runs collapsed). The
+    underlying value keeps the real Thai text, which the Alt-L popup edits
+    and the PDF prints. Text without Thai is returned unchanged."""
+    if not has_thai(s):
+        return s
+    import re
+    kept = "".join(
+        " " if ("\u0e00" <= ch <= "\u0e7f") else ch for ch in str(s))
+    return re.sub(r" {2,}", " ", kept).strip()
+
+
 def init_thai_locale():
     """Force a UTF-8 locale so Unicode box drawing and Thai render correctly.
 
@@ -77,12 +127,20 @@ def disp_width(s):
 
 def _trim_to_width(s, width):
     """Return the tail of s that fits in `width` display columns, keeping whole
-    code points (so a base is never separated from its combining mark)."""
-    if disp_width(s) <= width:
+    code points (so a base is never separated from its combining mark).
+
+    Curses wraps addstr() output by CODE POINT count, not display width — a
+    Thai string whose display width fits but whose code points exceed `width`
+    would wrap mid-line. So the result is capped on BOTH measures; if the
+    code-point cap has to split a trailing mark from its base, the mark
+    overhangs the last cell instead of wrapping (much less visible damage).
+    """
+    if disp_width(s) <= width and len(s) <= width:
         return s
     out = []
     for ch in reversed(s):
-        if disp_width(ch) + disp_width("".join(out)) > width:
+        if (disp_width("".join(out)) + disp_width(ch) > width
+                or len(out) + 1 > width):
             break
         out.append(ch)
     return "".join(reversed(out))

@@ -2,7 +2,8 @@ windows-curses>=2.3.0; sys_platform == "win32"
 reportlab>=4.0
 websockets>=12.0
 pyinstaller>=6.0
-pyfiglet>=1.0.2
+# pytitle: big pixel-text banners (local dev install: pip install -e D:\pytitle)
+pytitle>=1.1.0
 websocket-client>=1.8
 pandas>=2.0
 openpyxl>=3.1

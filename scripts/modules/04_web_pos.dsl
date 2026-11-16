@@ -19,8 +19,8 @@ FORM wo TITLE "Web Order" ENTRY COLS 2
     category   | 14 | ro
     uom        |  5 | ro
     wh_balance |  8 | num ro
-    unit_price | 10 | num ro
     order_qty  | 10 | num
+    unit_price | 10 | num ro
     amount     | 14 | num ro formula:order_qty*unit_price
     base_uom   |  6 | ro hidden
     pack_uom   |  6 | ro hidden

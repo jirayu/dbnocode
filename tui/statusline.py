@@ -26,7 +26,7 @@ PAGE_KEYS = {
     "grid": [
         ("Enter", "Edit", True),
         ("F3", "New", True),
-        ("Ctrl+D", "Delete", True),
+        ("Ctrl+D/Del", "Delete", True),
         ("F7", "Filter", True),
         ("F8", "Columns", True),
         ("F9", "Theme", True),
@@ -56,8 +56,8 @@ PAGE_KEYS = {
     ],
     "tab_grid": [
         ("F4", "Lookup", True),
-        ("Ins", "New Row", True),
-        ("Ctrl+D", "Del Row", True),
+        ("Ctrl+Ins", "Ins Row", True),
+        ("Ctrl+D/Del", "Del Row", True),
         ("F5", "Post", False),       # shown only if workflow
         ("Ctrl+U", "UOM", True),
         ("F7", "Filter", True),
